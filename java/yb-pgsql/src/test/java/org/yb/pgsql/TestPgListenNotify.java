@@ -58,6 +58,12 @@ public class TestPgListenNotify extends BasePgListenNotifyTest {
 
   private static final String CHANNEL = "test_channel";
   private static final String PAYLOAD = "test_payload";
+  private static final String LARGE_PAYLOAD;
+  static {
+    char[] chars = new char[7000];
+    Arrays.fill(chars, 'x');
+    LARGE_PAYLOAD = new String(chars);
+  }
 
   /**
    * LISTEN should fail when cdc_max_virtual_wal_per_tserver is 0 (no virtual
@@ -881,58 +887,136 @@ public class TestPgListenNotify extends BasePgListenNotifyTest {
   }
 
   /**
-   * When the NOTIFY queue is full, the notifications poller should terminate the slowest listener
-   * to let the queue tail advance if another listener has caught up to the head. Verify that the
-   * slow listener is terminated while the fast listener stays alive.
-   *
-   * Uses yb_test_notify_queue_max_pages to artificially limit the queue so it fills up with a
-   * handful of large-payload notifications.
+   * When the NOTIFY queue fills up, verify that the slow listener is terminated.
    */
   @Test
-  public void testQueueFullTerminatesSlowestListener() throws Exception {
-    setNotifyQueueMaxPages("2");
-    try {
-      Connection connSlow = getConnectionBuilder().connect();
-      Connection connFast = getConnectionBuilder().connect();
-      Connection connNotifier = getConnectionBuilder().connect();
+  public void testQueueFullWithOneSlowListener() throws Exception {
+    fillQueueAndAssertSlowListenersTerminated(1);
+  }
 
-      // Register a listener and make it slow by starting an indefinite transaction (notifications
-      // are not delivered when the backend is inside a transaction).
-      try (Statement stmt = connSlow.createStatement()) {
-        stmt.execute("LISTEN ch1");
-        stmt.execute("BEGIN");
-      }
+  /**
+   * When the NOTIFY queue fills up, verify that both the slow listeners are terminated.
+   */
+  @Test
+  public void testQueueFullWithTwoSlowListeners() throws Exception {
+    fillQueueAndAssertSlowListenersTerminated(2);
+  }
+
+  /**
+   * When the NOTIFY queue fills up, verify that the slow listener is terminated and the fast
+   * listener receives all the notifications even though a single transaction sends more
+   * notifications than the queue capacity.
+   */
+  @Test
+  public void testQueueFullWithLargeTransaction() throws Exception {
+    try (Connection connFast = getConnectionBuilder().connect()) {
       try (Statement stmt = connFast.createStatement()) {
         stmt.execute("LISTEN ch1");
       }
+      fillQueueAndAssertSlowListenersTerminated(1);
+      waitForNotification(connFast, "ch1", LARGE_PAYLOAD);
+    }
+  }
 
-      // Send enough large-payload notifications to fill the small queue.
-      char[] chars = new char[7000];
-      Arrays.fill(chars, 'x');
-      String largePayload = new String(chars);
-      try (Statement stmt = connNotifier.createStatement()) {
-        for (int i = 0; i < 10; i++) {
-          stmt.execute("NOTIFY ch1, '" + largePayload + "'");
-        }
+  private Connection createSlowListener(String channel) throws Exception {
+    Connection conn = getConnectionBuilder().connect();
+    try (Statement stmt = conn.createStatement()) {
+      stmt.execute("LISTEN " + channel);
+      stmt.execute("BEGIN");
+    }
+    return conn;
+  }
+
+  private Connection fillQueue(String channel, int count) throws Exception {
+    Connection conn = getConnectionBuilder().connect();
+    try (Statement stmt = conn.createStatement()) {
+      for (int i = 0; i < count; i++) {
+        stmt.execute("NOTIFY " + channel + ", '" + LARGE_PAYLOAD + "'");
       }
+    }
+    return conn;
+  }
 
-      // Wait for the poller to detect the full queue and terminate the slow
-      // listener, then verify its connection is dead.
+  private void assertConnectionTerminated(Connection conn, String label) {
+    try (Statement stmt = conn.createStatement()) {
+      stmt.execute("SELECT 1");
+      fail(label + " should have been terminated");
+    } catch (SQLException e) {
+      LOG.info("{} error (expected): {}", label, e.getMessage());
+    }
+  }
+
+  /**
+   * Uses yb_test_notify_queue_max_pages to artificially limit the queue so it fills up with a
+   * handful of large-payload notifications.
+   */
+  private void fillQueueAndAssertSlowListenersTerminated(int numSlowListeners) throws Exception {
+    setNotifyQueueMaxPages("2");
+    try {
+      Connection[] slowListeners = new Connection[numSlowListeners];
+      for (int i = 0; i < numSlowListeners; i++) {
+        slowListeners[i] = createSlowListener("ch1");
+      }
+      Connection connNotifier = fillQueue("ch1", 10);
       Thread.sleep(5000);
-      try (Statement stmt = connSlow.createStatement()) {
-        stmt.execute("SELECT 1");
-        fail("Slow listener should have been terminated");
-      } catch (SQLException e) {
-        LOG.info("Slow listener error (expected): {}", e.getMessage());
+      for (int i = 0; i < numSlowListeners; i++) {
+        assertConnectionTerminated(slowListeners[i], "Slow listener " + (i + 1));
       }
-
-      // Fast listener should still be alive.
-      waitForNotification(connFast, "ch1", largePayload);
-
-      connFast.close();
       connNotifier.close();
     } finally {
       setNotifyQueueMaxPages("0");
+    }
+  }
+
+  /**
+   * Verifies that LISTEN/NOTIFY works even after a non-INSERT/DELETE record (i.e., an UPDATE)
+   * appears in the pg_yb_notifications CDC stream. The notifications poller consumes the CDC
+   * stream for pg_yb_notifications; an UPDATE record is unexpected (users never UPDATE this
+   * table) and must not break the poller.
+   *
+   * Scenario:
+   *   1. Session starts LISTEN.
+   *   2. NOTIFY is sent and received by the listener.
+   *   3. A dummy row is INSERTed into pg_yb_notifications and then UPDATEd (producing a
+   *      non-INSERT/DELETE CDC record).
+   *   4. Another NOTIFY is sent and received by the listener, proving the poller survived.
+   */
+  @Test
+  public void testNotifyWorksAfterUpdateOnNotificationsTable() throws Exception {
+    final String channel = "update_test";
+
+    try (Connection listenerConn = getConnectionBuilder().connect();
+         Connection notifierConn = getConnectionBuilder().connect()) {
+      try (Statement stmt = listenerConn.createStatement()) {
+        stmt.execute("LISTEN " + channel);
+      }
+
+      // First NOTIFY: baseline check.
+      try (Statement stmt = notifierConn.createStatement()) {
+        stmt.execute("NOTIFY " + channel + ", 'before_update'");
+      }
+      waitForNotification(listenerConn, channel, "before_update");
+      LOG.info("Received notification before UPDATE on pg_yb_notifications");
+
+      // INSERT a dummy row into pg_yb_notifications and UPDATE it.
+      try (Connection ybSystemConn =
+               getConnectionBuilder().withDatabase("yb_system").connect();
+           Statement stmt = ybSystemConn.createStatement()) {
+        stmt.execute("INSERT INTO pg_yb_notifications"
+            + " (notif_uuid, sender_node_uuid, sender_pid, db_oid, is_listen, data)"
+            + " VALUES ('00000000-0000-0000-0000-000000000001',"
+            + " '00000000-0000-0000-0000-000000000002', 0, 0, false, '\\x00')");
+        stmt.execute("UPDATE pg_yb_notifications SET sender_pid = 1"
+            + " WHERE notif_uuid = '00000000-0000-0000-0000-000000000001'");
+        LOG.info("Inserted and updated dummy row in pg_yb_notifications");
+      }
+
+      // Second NOTIFY: must still work after the UPDATE record hit the CDC stream.
+      try (Statement stmt = notifierConn.createStatement()) {
+        stmt.execute("NOTIFY " + channel + ", 'after_update'");
+      }
+      waitForNotification(listenerConn, channel, "after_update");
+      LOG.info("Received notification after UPDATE on pg_yb_notifications");
     }
   }
 

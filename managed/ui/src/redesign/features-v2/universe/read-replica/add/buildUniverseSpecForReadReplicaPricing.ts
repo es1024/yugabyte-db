@@ -88,7 +88,7 @@ function sanitizeClusterForPricing(cluster: ClusterSpec): ClusterSpec {
   return sanitized;
 }
 
-function sanitizeClusters(clusters: ClusterSpec[] | undefined): ClusterSpec[] {
+export function sanitizeClusters(clusters: ClusterSpec[] | undefined): ClusterSpec[] {
   return (clusters ?? []).map((cluster) => sanitizeClusterForPricing(cluster));
 }
 
@@ -157,7 +157,7 @@ function clusterSpecFromAddPayload(
 
   const placementFromPartitions =
     add.partitions_spec?.find((p) => p.default_partition) ?? add.partitions_spec?.[0];
-  const placement_spec = placementFromPartitions?.placement;
+  const placement_spec = placementFromPartitions?.placement ?? add.placement_spec;
 
   return sanitizeClusterForPricing({
     uuid: proposedAsyncClusterUuid,
@@ -167,7 +167,7 @@ function clusterSpecFromAddPayload(
     node_spec: add.node_spec,
     provider_spec,
     ...(placement_spec ? { placement_spec } : {}),
-    partitions_spec: add.partitions_spec,
+    ...(add.partitions_spec ? { partitions_spec: add.partitions_spec } : {}),
     gflags: add.gflags,
     ...(add.instance_tags ? { instance_tags: add.instance_tags } : {})
   });
@@ -220,7 +220,8 @@ export function buildUniverseSpecForReadReplicaPricing(
       const placementFromEditPartitions =
         editSpec.partitions_spec?.find((p) => p.default_partition) ??
         editSpec.partitions_spec?.[0];
-      const mirroredPlacement = placementFromEditPartitions?.placement;
+      const mirroredPlacement =
+        placementFromEditPartitions?.placement ?? editSpec.placement_spec;
 
       return sanitizeClusterForPricing({
         ...cluster,

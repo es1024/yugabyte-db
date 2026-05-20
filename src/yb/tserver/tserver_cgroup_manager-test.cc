@@ -24,6 +24,8 @@
 
 #include "yb/gutil/sysinfo.h"
 
+#include "yb/common/entity_ids.h"
+
 #include "yb/util/cgroups.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
@@ -31,6 +33,9 @@
 #include "yb/util/test_util.h"
 
 DECLARE_bool(enable_qos);
+DECLARE_bool(qos_system_dbs_use_shared_pool);
+DECLARE_bool(qos_consensus_per_db_cgroups);
+DECLARE_bool(qos_compaction_per_db_cgroups);
 DECLARE_double(qos_max_db_cpu_percent);
 DECLARE_int32(qos_evaluation_window_us);
 DECLARE_int32(qos_metrics_interval_sec);
@@ -347,6 +352,68 @@ TEST_F(TServerCgroupManagerTest, TestCgroupMetricsLateMetadata) {
   manager_->RegisterDbName(db_oid, db_name);
 
   // The background thread should pick up the late-arriving name.
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_EQ(ASSERT_RESULT(entity->TEST_GetAttributeFromMap("database_name")), db_name);
+    ASSERT_EQ(ASSERT_RESULT(entity->TEST_GetAttributeFromMap("database_oid")),
+              std::to_string(db_oid));
+  });
+}
+
+TEST_F(TServerCgroupManagerTest, TestSystemDbOidsExcludedFromPerDbPools) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_qos_system_dbs_use_shared_pool) = true;
+
+  // IsQosSystemDatabaseOid should identify system OIDs.
+  ASSERT_TRUE(IsQosSystemDatabaseOid(kPgSequencesDataDatabaseOid));
+  ASSERT_TRUE(IsQosSystemDatabaseOid(kTemplate1Oid));
+  ASSERT_FALSE(IsQosSystemDatabaseOid(16640));  // Normal user DB OID.
+
+  // Normal user DB should create a per-DB cgroup.
+  constexpr PgOid user_db_oid = 16640;
+  auto& user_cgroup = ASSERT_RESULT_REF(manager_->CgroupForDb(user_db_oid));
+  ASSERT_EQ(user_cgroup.name(), "/@capped-pool/@normal/db_16640");
+
+  ASSERT_TRUE(IsQosSystemDatabaseOid(kPgSequencesDataDatabaseOid));
+
+  // Now disable the flag and verify the system OID CAN create a cgroup.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_qos_system_dbs_use_shared_pool) = false;
+  auto& seq_cgroup = ASSERT_RESULT_REF(
+      manager_->CgroupForDb(kPgSequencesDataDatabaseOid));
+  ASSERT_EQ(seq_cgroup.name(), "/@capped-pool/@normal/db_65535");
+
+  // Re-enable the flag -- the cgroup still exists (it's already created), but
+  // PerDbCgroupProvider and PoolTag() would route new RPCs away from it.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_qos_system_dbs_use_shared_pool) = true;
+  ASSERT_TRUE(IsQosSystemDatabaseOid(kPgSequencesDataDatabaseOid));
+}
+
+TEST_F(TServerCgroupManagerTest, TestDatabaseNameRegisteredUnconditionally) {
+  // Verify that database names are registered and appear in metrics even when
+  // per-DB cgroup flags are disabled (e.g., when cgroups are created from
+  // pg_client_session). Regression test for #31664.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_qos_consensus_per_db_cgroups) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_qos_compaction_per_db_cgroups) = false;
+
+  constexpr PgOid db_oid = 55555;
+  const std::string db_name = "test_db";
+
+  // Simulate pg_client_session creating a cgroup without a name.
+  ASSERT_OK(manager_->CgroupForDb(db_oid));
+
+  auto entity = FindCgroupEntity(Format("db_$0", db_oid));
+
+  // Cgroup should exist with database_oid but no database_name yet.
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_EQ(ASSERT_RESULT(entity->TEST_GetAttributeFromMap("database_oid")),
+              std::to_string(db_oid));
+    auto name_result = entity->TEST_GetAttributeFromMap("database_name");
+    ASSERT_TRUE(!name_result.ok() || name_result->empty());
+  });
+
+  // Simulate ts_tablet_manager registering the database name (unconditionally,
+  // regardless of per-DB cgroup flags).
+  manager_->RegisterDbName(db_oid, db_name);
+
+  // Verify database_name appears in metrics even with per-DB flags disabled.
   ASSERT_EVENTUALLY([&] {
     ASSERT_EQ(ASSERT_RESULT(entity->TEST_GetAttributeFromMap("database_name")), db_name);
     ASSERT_EQ(ASSERT_RESULT(entity->TEST_GetAttributeFromMap("database_oid")),

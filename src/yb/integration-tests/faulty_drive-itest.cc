@@ -130,14 +130,20 @@ TEST_F(FaultyDriveTest, MasterClearsFaultyDriveOnTServerRestartAfterFix) {
       [&]() -> Result<bool> { return master_sees_faulty(); }, kDefaultTimeout,
       "Master to observe faulty_drive=true"));
 
-  // /tablet-servers HTML and /api/v1/tablet-servers JSON should both surface the faulty drive.
+  // Master UI should surface the effective LB blacklist state.
   {
     const auto html = ASSERT_RESULT(fetch_master_url("/tablet-servers"));
-    ASSERT_NE(html.find("Faulty Drive"), std::string::npos)
-        << "Expected '/tablet-servers' HTML to contain 'Faulty Drive'";
+    ASSERT_NE(html.find("Blacklisted (faulty drive)"), std::string::npos)
+        << "Expected '/tablet-servers' HTML to report the TS is Blacklisted";
     const auto json = ASSERT_RESULT(fetch_master_url("/api/v1/tablet-servers"));
     ASSERT_NE(json.find("\"has_faulty_drive\":true"), std::string::npos)
         << "Expected '/api/v1/tablet-servers' JSON to report has_faulty_drive=true";
+
+    const auto cluster_config_html = ASSERT_RESULT(fetch_master_url("/cluster-config"));
+    ASSERT_NE(cluster_config_html.find("Effective load balancer server blacklist"),
+              std::string::npos);
+    ASSERT_NE(cluster_config_html.find(ts_uuid), std::string::npos);
+    ASSERT_NE(cluster_config_html.find("faulty_drive"), std::string::npos);
   }
 
   // (2) Restart again WITHOUT fixing the drive. The master  must continue to see the TServer as
@@ -167,8 +173,8 @@ TEST_F(FaultyDriveTest, MasterClearsFaultyDriveOnTServerRestartAfterFix) {
   // After recovery the indicator must disappear from both the HTML and JSON endpoints.
   {
     const auto html = ASSERT_RESULT(fetch_master_url("/tablet-servers"));
-    ASSERT_EQ(html.find("Faulty Drive"), std::string::npos)
-        << "Expected '/tablet-servers' HTML to no longer contain 'Faulty Drive'";
+    ASSERT_EQ(html.find("Blacklisted (faulty drive)"), std::string::npos)
+        << "Expected '/tablet-servers' HTML to no longer report Blacklisted";
     const auto json = ASSERT_RESULT(fetch_master_url("/api/v1/tablet-servers"));
     ASSERT_EQ(json.find("\"has_faulty_drive\":true"), std::string::npos)
         << "Expected '/api/v1/tablet-servers' JSON to no longer report has_faulty_drive=true";

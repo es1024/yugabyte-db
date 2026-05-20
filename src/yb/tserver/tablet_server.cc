@@ -44,6 +44,7 @@
 #include "yb/client/universe_key_client.h"
 
 #include "yb/common/common_flags.h"
+#include "yb/common/entity_ids.h"
 #include "yb/common/common_util.h"
 #include "yb/common/pg_catversions.h"
 #include "yb/common/schema.h"
@@ -136,38 +137,39 @@ DEPRECATE_FLAG(int32, tablet_server_svc_num_threads, "02_2024");
 DEPRECATE_FLAG(int32, ts_admin_svc_num_threads, "02_2024");
 DEPRECATE_FLAG(int32, ts_consensus_svc_num_threads, "02_2024");
 DEPRECATE_FLAG(int32, ts_remote_bootstrap_svc_num_threads, "02_2024");
-DEFINE_UNKNOWN_int32(tablet_server_svc_queue_length,
+DEFINE_NON_RUNTIME_int32(tablet_server_svc_queue_length,
     yb::tserver::TabletServer::kDefaultSvcQueueLength,
     "RPC queue length for the TS service.");
 TAG_FLAG(tablet_server_svc_queue_length, advanced);
 
-DEFINE_UNKNOWN_int32(ts_admin_svc_queue_length, 50,
+DEFINE_NON_RUNTIME_int32(ts_admin_svc_queue_length, 50,
              "RPC queue length for the TS admin service");
 TAG_FLAG(ts_admin_svc_queue_length, advanced);
 
-DEFINE_UNKNOWN_int32(ts_consensus_svc_queue_length,
+DEFINE_NON_RUNTIME_int32(ts_consensus_svc_queue_length,
     yb::tserver::TabletServer::kDefaultSvcQueueLength,
     "RPC queue length for the TS consensus service.");
 TAG_FLAG(ts_consensus_svc_queue_length, advanced);
 
-DEFINE_UNKNOWN_int32(ts_remote_bootstrap_svc_queue_length, 50,
+DEFINE_NON_RUNTIME_int32(ts_remote_bootstrap_svc_queue_length, 50,
              "RPC queue length for the TS remote bootstrap service");
 TAG_FLAG(ts_remote_bootstrap_svc_queue_length, advanced);
 
-DEFINE_UNKNOWN_int32(pg_client_svc_queue_length, yb::tserver::TabletServer::kDefaultSvcQueueLength,
+DEFINE_NON_RUNTIME_int32(pg_client_svc_queue_length,
+             yb::tserver::TabletServer::kDefaultSvcQueueLength,
              "RPC queue length for the Pg Client service.");
 TAG_FLAG(pg_client_svc_queue_length, advanced);
 
-DEFINE_UNKNOWN_bool(enable_direct_local_tablet_server_call,
+DEFINE_NON_RUNTIME_bool(enable_direct_local_tablet_server_call,
             true,
             "Enable direct call to local tablet server");
 TAG_FLAG(enable_direct_local_tablet_server_call, advanced);
 
-DEFINE_UNKNOWN_string(redis_proxy_bind_address, "", "Address to bind the redis proxy to");
-DEFINE_UNKNOWN_int32(redis_proxy_webserver_port, 0, "Webserver port for redis proxy");
+DEFINE_NON_RUNTIME_string(redis_proxy_bind_address, "", "Address to bind the redis proxy to");
+DEFINE_NON_RUNTIME_int32(redis_proxy_webserver_port, 0, "Webserver port for redis proxy");
 
-DEFINE_UNKNOWN_string(cql_proxy_bind_address, "", "Address to bind the CQL proxy to");
-DEFINE_UNKNOWN_int32(cql_proxy_webserver_port, 0, "Webserver port for CQL proxy");
+DEFINE_NON_RUNTIME_string(cql_proxy_bind_address, "", "Address to bind the CQL proxy to");
+DEFINE_NON_RUNTIME_int32(cql_proxy_webserver_port, 0, "Webserver port for CQL proxy");
 
 DEFINE_NON_RUNTIME_string(pgsql_proxy_bind_address, "", "Address to bind the PostgreSQL proxy to");
 DECLARE_int32(pgsql_proxy_webserver_port);
@@ -179,9 +181,9 @@ DEFINE_NON_RUNTIME_bool(enable_ysql_conn_mgr, false,
 DEFINE_NON_RUNTIME_int32(ysql_conn_mgr_max_pools, 10000,
     "Max total pools supported in YSQL Connection Manager.");
 
-DEFINE_UNKNOWN_int64(inbound_rpc_memory_limit, 0, "Inbound RPC memory limit");
+DEFINE_NON_RUNTIME_int64(inbound_rpc_memory_limit, 0, "Inbound RPC memory limit");
 
-DEFINE_UNKNOWN_bool(tserver_enable_metrics_snapshotter, false,
+DEFINE_NON_RUNTIME_bool(tserver_enable_metrics_snapshotter, false,
     "Should metrics snapshotter be enabled");
 
 DEFINE_test_flag(uint64, pg_auth_key, 0, "Forces an auth key for the postgres user when non-zero");
@@ -201,11 +203,11 @@ DEFINE_test_flag(bool, select_all_status_tablets, false, "");
 
 DEPRECATE_FLAG(int32, ts_backup_svc_num_threads, "02_2024");
 
-DEFINE_UNKNOWN_int32(ts_backup_svc_queue_length, 50,
+DEFINE_NON_RUNTIME_int32(ts_backup_svc_queue_length, 50,
              "RPC queue length for the TS backup service");
 TAG_FLAG(ts_backup_svc_queue_length, advanced);
 
-DEFINE_UNKNOWN_int32(xcluster_svc_queue_length, 5000,
+DEFINE_NON_RUNTIME_int32(xcluster_svc_queue_length, 5000,
              "RPC queue length for the xCluster service");
 TAG_FLAG(xcluster_svc_queue_length, advanced);
 
@@ -214,15 +216,13 @@ DEFINE_NON_RUNTIME_bool(allow_encryption_at_rest, true,
                         "flag does not turn on or off encryption at rest, but rather allows or "
                         "disallows a user from enabling it on in the future.");
 
-DEFINE_UNKNOWN_int32(
-    get_universe_key_registry_backoff_increment_ms, 100,
+DEFINE_NON_RUNTIME_int32(get_universe_key_registry_backoff_increment_ms, 100,
     "Number of milliseconds added to the delay between retries of fetching the full universe key "
     "registry from master leader. This delay is applied after the RPC reties have been exhausted.");
 TAG_FLAG(get_universe_key_registry_backoff_increment_ms, stable);
 TAG_FLAG(get_universe_key_registry_backoff_increment_ms, advanced);
 
-DEFINE_UNKNOWN_int32(
-    get_universe_key_registry_max_backoff_sec, 3,
+DEFINE_NON_RUNTIME_int32(get_universe_key_registry_max_backoff_sec, 3,
     "Maximum number of seconds to delay between retries of fetching the full universe key registry "
     "from master leader. This delay is applied after the RPC reties have been exhausted.");
 TAG_FLAG(get_universe_key_registry_max_backoff_sec, stable);
@@ -251,17 +251,16 @@ DEFINE_NON_RUNTIME_int32(stateful_svc_default_queue_length, 50,
 DEFINE_RUNTIME_bool(tserver_heartbeat_add_replication_status, true,
     "Add replication status to heartbeats tserver sends to master");
 
-DEFINE_RUNTIME_int32(
-    check_lagging_catalog_versions_interval_secs, 900,
+DEFINE_RUNTIME_int32(check_lagging_catalog_versions_interval_secs, 900,
     "Interval at which pg backends are checked for lagging catalog versions.");
 TAG_FLAG(check_lagging_catalog_versions_interval_secs, advanced);
 
-DEFINE_RUNTIME_int32(
-    min_invalidation_message_retention_time_secs, 60,
+DEFINE_RUNTIME_int32(min_invalidation_message_retention_time_secs, 60,
     "Minimal time at which a catalog version with invalidation message is retained.");
 TAG_FLAG(min_invalidation_message_retention_time_secs, advanced);
 
 DECLARE_bool(enable_qos);
+DECLARE_bool(qos_system_dbs_use_shared_pool);
 DECLARE_bool(ysql_enable_auto_analyze_infra);
 DECLARE_int32(update_min_cdc_indices_interval_secs);
 DECLARE_uint64(ysql_lease_refresher_rpc_timeout_ms);
@@ -1375,67 +1374,60 @@ Status TabletServer::SetTserverCatalogMessageList(
   return Status::OK();
 }
 
-Status TabletServer::TriggerRelcacheInitConnection(
+void TabletServer::TriggerRelcacheInitConnection(
     const TriggerRelcacheInitConnectionRequestPB& req,
-    TriggerRelcacheInitConnectionResponsePB *resp) {
+    StdStatusCallback callback) {
   const std::string dbname = req.database_name();
-  std::shared_future<Status> future_for_this_request;
 
   bool started_superuser_connection = false;
   {
     std::lock_guard l(lock_);
-    auto it = in_flight_superuser_connections_.find(dbname);
-
-    if (it != in_flight_superuser_connections_.end()) {
-      LOG(INFO) << "Relcache init connection request to database " << dbname << " in progress";
-      future_for_this_request = it->second;
-    } else {
-      // In case there are multiple concurrent racing threads, this thread is the winner.
+    auto& callbacks = in_flight_superuser_connections_[dbname];
+    if (callbacks.empty()) {
       started_superuser_connection = true;
       LOG(INFO) << "Relcache init connection request to database " << dbname
                 << " starting from tserver " << this << " to " << pgsql_proxy_bind_address();
-
-      auto p = std::make_shared<std::promise<Status>>();
-      future_for_this_request = p->get_future().share();
-      in_flight_superuser_connections_[dbname] = future_for_this_request;
-
-      messenger()->scheduler().Schedule(
-        [this, p, dbname](const Status& status) {
-          if (!status.ok()) {
-            LOG(INFO) << status;
-            RelcacheInitConnectionDone(p.get(), dbname, status);
-            return;
-          }
-          MakeRelcacheInitConnection(p.get(), dbname);
-        }, std::chrono::steady_clock::duration(0));
+    } else {
+      LOG(INFO) << "Relcache init connection request to database " << dbname << " in progress";
     }
+    callbacks.push_back(std::move(callback));
   }
-  auto timeout = default_client_timeout();
-  std::future_status status = future_for_this_request.wait_for(timeout.ToSteadyDuration());
 
-  if (started_superuser_connection) {
-    std::lock_guard l(lock_);
-    in_flight_superuser_connections_.erase(dbname);
+  if (!started_superuser_connection) {
+    return;
   }
-  if (status == std::future_status::ready) {
-    return future_for_this_request.get();
-  }
-  return STATUS_FORMAT(TimedOut, "Relcache init connection request to database $0 timed out",
-                       dbname);
+
+  messenger()->scheduler().Schedule(
+      [this, dbname](const Status& status) {
+        if (!status.ok()) {
+          LOG(INFO) << status;
+          RelcacheInitConnectionDone(dbname, status);
+          return;
+        }
+        MakeRelcacheInitConnection(dbname);
+      },
+      std::chrono::steady_clock::duration(0));
 }
 
 void TabletServer::RelcacheInitConnectionDone(
-    std::promise<Status>* p, const std::string& dbname, const Status& status) {
-  // Do set_value and erase atomically.
-  std::lock_guard l(lock_);
-
-  // Fulfill the promise, unblocking all waiting threads for this task.
-  p->set_value(status);
-  // Clean up dbname from the map so that next winner can create superuser connection.
-  in_flight_superuser_connections_.erase(dbname);
+    const std::string& dbname, const Status& status) {
+  std::vector<StdStatusCallback> callbacks;
+  {
+    std::lock_guard l(lock_);
+    auto it = in_flight_superuser_connections_.find(dbname);
+    if (it == in_flight_superuser_connections_.end()) {
+      LOG(DFATAL) << "Cannot find in-flight superuser connection for database " << dbname;
+      return;
+    }
+    callbacks = std::move(it->second);
+    in_flight_superuser_connections_.erase(it);
+  }
+  for (auto& cb : callbacks) {
+    cb(status);
+  }
 }
 
-void TabletServer::MakeRelcacheInitConnection(std::promise<Status>* p, const std::string& dbname) {
+void TabletServer::MakeRelcacheInitConnection(const std::string& dbname) {
   auto deadline = CoarseMonoClock::Now() + default_client_timeout();
   auto status = ResultToStatus(CreateInternalPGConn(dbname, false, deadline));
   if (status.ok()) {
@@ -1443,7 +1435,7 @@ void TabletServer::MakeRelcacheInitConnection(std::promise<Status>* p, const std
   } else {
     LOG(INFO) << "Relcache init connection to database " << dbname << " failed: " << status;
   }
-  RelcacheInitConnectionDone(p, dbname, status);
+  RelcacheInitConnectionDone(dbname, status);
 }
 
 void TabletServer::SetYsqlCatalogVersion(uint64_t new_version, uint64_t new_breaking_version) {
@@ -2200,7 +2192,11 @@ Cgroup* TabletServer::PerDbCgroupProvider(rpc::ThreadPoolTag tag) {
                 << tag;
     return nullptr;
   }
-  auto cgroup_result = cgroup_manager_->CgroupForDb(static_cast<PgOid>(tag));
+  auto db_oid = static_cast<PgOid>(tag);
+  if (FLAGS_qos_system_dbs_use_shared_pool && IsQosSystemDatabaseOid(db_oid)) {
+    return nullptr;
+  }
+  auto cgroup_result = cgroup_manager_->CgroupForDb(db_oid);
   if (!cgroup_result.ok()) {
     LOG(DFATAL) << "failed to get cgroup for database " << tag << ": "
                 << cgroup_result.status();

@@ -40,8 +40,11 @@
 #include <regex>
 #include <sstream>
 #include <unordered_set>
+#include <vector>
 
 #include <boost/date_time/posix_time/time_formatters.hpp>
+
+#include "yb/gutil/strings/join.h"
 
 #include "yb/common/common_consensus_util.h"
 #include "yb/common/xcluster_util.h"
@@ -98,13 +101,13 @@
 #include "yb/util/html_print_helper.h"
 #include "yb/util/jsonwriter.h"
 #include "yb/util/logging.h"
+#include "yb/util/object_provider.h"
 #include "yb/util/string_case.h"
 #include "yb/util/timestamp.h"
 #include "yb/util/url-coding.h"
 #include "yb/common/version_info.h"
 
-DEFINE_RUNTIME_int32(
-    hide_dead_node_threshold_mins, 60 * 24,
+DEFINE_RUNTIME_int32(hide_dead_node_threshold_mins, 60 * 24,
     "After this many minutes of no heartbeat from a node, hide it from the UI "
     "(we presume it has been removed from the cluster). If -1, this flag is ignored and node is "
     "never hidden from the UI");
@@ -515,6 +518,34 @@ struct LocalTserverInfo {
   }
 };
 
+std::vector<std::string> LoadBalancerServerBlacklistReasons(
+    const std::shared_ptr<TSDescriptor>& ts_desc,
+    const BlacklistSet& persisted_server_blacklist) {
+  std::vector<std::string> reasons;
+  if (ts_desc->IsBlacklisted(persisted_server_blacklist)) {
+    reasons.push_back("config");
+  }
+  if (ts_desc->has_faulty_drive()) {
+    reasons.push_back("faulty_drive");
+  }
+  return reasons;
+}
+
+using EffectiveBlacklistEntry = std::pair<std::string, std::vector<std::string>>;
+
+std::vector<EffectiveBlacklistEntry> EffectiveLoadBalancerServerBlacklist(
+    const std::vector<std::shared_ptr<TSDescriptor>>& descs,
+    const BlacklistSet& persisted_server_blacklist) {
+  std::vector<EffectiveBlacklistEntry> result;
+  for (const auto& desc : descs) {
+    auto reasons = LoadBalancerServerBlacklistReasons(desc, persisted_server_blacklist);
+    if (!reasons.empty()) {
+      result.emplace_back(desc->permanent_uuid(), std::move(reasons));
+    }
+  }
+  return result;
+}
+
 }  // anonymous namespace
 
 MasterPathHandlers::UniverseTabletCounts MasterPathHandlers::CalculateUniverseTabletCounts(
@@ -601,7 +632,7 @@ void MasterPathHandlers::TServerDisplay(
 
     if (desc->IsBlacklisted(blacklist)) {
       tserver_info.color = tserver_info.color == "Green" ? kYBOrange : tserver_info.color;
-      tserver_info.status += "</br>Blacklisted";
+      tserver_info.status += "</br>Blacklisted (config)";
     }
     if (desc->IsBlacklisted(leader_blacklist)) {
       tserver_info.color = tserver_info.color == "Green" ? kYBOrange : tserver_info.color;
@@ -609,7 +640,7 @@ void MasterPathHandlers::TServerDisplay(
     }
     if (desc->has_faulty_drive()) {
       tserver_info.color = tserver_info.color == "Green" ? kYBOrange : tserver_info.color;
-      tserver_info.status += "</br>Faulty Drive";
+      tserver_info.status += "</br>Blacklisted (faulty drive)";
     }
 
     html_row.AddColumn(
@@ -1823,7 +1854,9 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
   }
 
   Schema schema;
+  ObjectProvider<Schema> partition_keys_schema;
   dockv::PartitionSchema partition_schema;
+  TableId indexed_table_id;
   NamespaceName keyspace_name;
   TableName table_name;
   TabletInfos tablets;
@@ -1920,19 +1953,61 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
     }
 
     Status s = SchemaFromPB(l->pb.schema(), &schema);
-    if (s.ok()) {
-      s = dockv::PartitionSchema::FromPB(l->pb.partition_schema(), schema, &partition_schema);
+    if (!s.ok()) {
+      *output << "Unable to decode table schema: " << EscapeForHtmlToString(s.ToString());
+      return;
     }
+    partition_keys_schema.reset(&schema);
+
+    s = dockv::PartitionSchema::FromPB(
+        l->pb.partition_schema(), *partition_keys_schema, &partition_schema);
     if (!s.ok()) {
       *output << "Unable to decode partition schema: " << EscapeForHtmlToString(s.ToString());
       return;
     }
+
     Result<TabletInfos> tablets_result = table->GetTabletsIncludeInactive();
     if (!tablets_result) {
       *output << "Unable to fetch tablets for table: " << EscapeForHtmlToString(s.ToString());
       return;
     }
     tablets = *tablets_result;
+
+    // If current table is a vector index, it is required to fetch the indexed table's schema and
+    // partition schema in order to display the partition keys correctly. But this should be done
+    // outside the current lock to avoid current table and indexed table lock contention.
+    if (l->is_vector_index()) {
+      indexed_table_id = l->indexed_table_id();
+    }
+  }
+
+  // Vector indexes are colocated on the indexed table's tablets, so their partition keys
+  // are encoded using the indexed table's schema, not the vector index's own schema.
+  if (!indexed_table_id.empty()) {
+    auto indexed_table = master_->catalog_manager()->GetTableInfo(indexed_table_id);
+    if (!indexed_table) {
+      *output << "Indexed table not found: " << indexed_table_id;
+      return;
+    }
+
+    auto indexed_lock = indexed_table->LockForRead();
+    partition_keys_schema.reset();
+    Status s = SchemaFromPB(indexed_lock->pb.schema(), partition_keys_schema.get());
+    if (!s.ok()) {
+      *output << "Unable to decode indexed table schema: "
+              << EscapeForHtmlToString(s.ToString());
+      return;
+    }
+
+    dockv::PartitionSchema indexed_partition_schema;
+    s = dockv::PartitionSchema::FromPB(
+        indexed_lock->pb.partition_schema(), *partition_keys_schema, &indexed_partition_schema);
+    if (!s.ok()) {
+      *output << "Unable to decode indexed table partition schema: "
+              << EscapeForHtmlToString(s.ToString());
+      return;
+    }
+    partition_schema = std::move(indexed_partition_schema);
   }
 
   server::HtmlOutputSchemaTable(schema, output);
@@ -1986,7 +2061,8 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
     *output << Format(
         "<tr><th>$0</th><td>$1</td><td>$2</td><td>$3</td><td>$4</td><td>$5</td><td>$6</td></tr>\n",
         tablet->tablet_id(),
-        EscapeForHtmlToString(partition_schema.PartitionDebugString(partition, schema)),
+        EscapeForHtmlToString(
+            partition_schema.PartitionDebugString(partition, *partition_keys_schema)),
         l->pb.split_depth(),
         ReplicaInfoToHtml(sorted_locations, tablet->tablet_id()),
         state,
@@ -2144,7 +2220,9 @@ void MasterPathHandlers::HandleTablePageJSON(const Webserver::WebRequest& req,
   }
 
   Schema schema;
+  ObjectProvider<Schema> partition_keys_schema;
   dockv::PartitionSchema partition_schema;
+  TableId indexed_table_id;
   TabletInfos tablets;
   {
     auto keyspace_name = master_->catalog_manager()->GetNamespaceName(table->namespace_id());
@@ -2230,9 +2308,15 @@ void MasterPathHandlers::HandleTablePageJSON(const Webserver::WebRequest& req,
     }
 
     Status s = SchemaFromPB(l->pb.schema(), &schema);
-    if (s.ok()) {
-      s = dockv::PartitionSchema::FromPB(l->pb.partition_schema(), schema, &partition_schema);
+    if (!s.ok()) {
+      jw.String("error");
+      jw.String("Unable to decode schema: " + s.ToString());
+      jw.EndObject();
+      return;
     }
+    partition_keys_schema.reset(&schema);
+
+    s = dockv::PartitionSchema::FromPB(l->pb.partition_schema(), schema, &partition_schema);
     if (!s.ok()) {
       jw.String("error");
       jw.String("Unable to decode partition schema: " + s.ToString());
@@ -2247,6 +2331,46 @@ void MasterPathHandlers::HandleTablePageJSON(const Webserver::WebRequest& req,
       return;
     }
     tablets = *tablets_result;
+
+    // If current table is a vector index, it is required to fetch the indexed table's schema and
+    // partition schema in order to display the partition keys correctly. But this should be done
+    // outside the current lock to avoid current table and indexed table lock contention.
+    if (l->is_vector_index()) {
+      indexed_table_id = l->indexed_table_id();
+    }
+  }
+
+  // Vector indexes are colocated on the indexed table's tablets, so their partition keys
+  // are encoded using the indexed table's schema, not the vector index's own schema.
+  if (!indexed_table_id.empty()) {
+    auto indexed_table = master_->catalog_manager()->GetTableInfo(indexed_table_id);
+    if (!indexed_table) {
+      jw.String("error");
+      jw.String("Indexed table not found: " + indexed_table_id);
+      jw.EndObject();
+      return;
+    }
+
+    auto indexed_lock = indexed_table->LockForRead();
+    partition_keys_schema.reset();
+    Status s = SchemaFromPB(indexed_lock->pb.schema(), partition_keys_schema.get());
+    if (!s.ok()) {
+      jw.String("error");
+      jw.String("Unable to decode indexed table schema: " + s.ToString());
+      jw.EndObject();
+      return;
+    }
+
+    dockv::PartitionSchema indexed_partition_schema;
+    s = dockv::PartitionSchema::FromPB(
+        indexed_lock->pb.partition_schema(), *partition_keys_schema, &indexed_partition_schema);
+    if (!s.ok()) {
+      jw.String("error");
+      jw.String("Unable to decode indexed table partition schema: " + s.ToString());
+      jw.EndObject();
+      return;
+    }
+    partition_schema = std::move(indexed_partition_schema);
   }
 
   JsonOutputSchemaTable(schema, &jw);
@@ -2267,7 +2391,7 @@ void MasterPathHandlers::HandleTablePageJSON(const Webserver::WebRequest& req,
     jw.String("tablet_id");
     jw.String(tablet->tablet_id());
     jw.String("partition");
-    jw.String(partition_schema.PartitionDebugString(partition, schema));
+    jw.String(partition_schema.PartitionDebugString(partition, *partition_keys_schema));
     jw.String("split_depth");
     jw.Uint64(l->pb.split_depth());
     jw.String("state");
@@ -3100,7 +3224,29 @@ void MasterPathHandlers::HandleGetClusterConfig(
     return;
   }
 
-  *output << "<div class=\"alert alert-success\">Successfully got cluster config!</div>"
+  *output << "<div class=\"alert alert-success\">Successfully got cluster config!</div>";
+
+  *output << "<h2>Effective load balancer server blacklist</h2>\n";
+  {
+    auto persisted_bl = master_->catalog_manager()->BlacklistSetFromPB(false);
+    const BlacklistSet bl = persisted_bl.ok() ? *persisted_bl : BlacklistSet();
+    auto effective_blacklist =
+        EffectiveLoadBalancerServerBlacklist(master_->ts_manager()->GetAllDescriptors(), bl);
+    if (!effective_blacklist.empty()) {
+      *output << "<table class=\"table\"><tr><th>Tablet server UUID</th><th>Blacklist reasons</th>"
+                 "</tr>\n";
+      for (const auto& [uuid, reasons] : effective_blacklist) {
+        *output << "<tr><td>" << EscapeForHtmlToString(uuid) << "</td><td>"
+                << EscapeForHtmlToString(JoinStrings(reasons, ", ")) << "</td></tr>\n";
+      }
+      *output << "</table>\n";
+    } else {
+      *output << "<p><i>None: no tablet servers are currently treated as server-blacklisted by "
+                 "the load balancer.</i></p>\n";
+    }
+  }
+
+  *output << "<h2>Persisted cluster configuration (sys catalog)</h2>\n"
           << "<pre class=\"prettyprint\">"
           << EscapeForHtmlToString(cluster_config_result->DebugString()) << "</pre>";
 }

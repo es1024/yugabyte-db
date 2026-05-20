@@ -1,4 +1,4 @@
-import { FC, useState } from 'react';
+import { FC } from 'react';
 import { useForm } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from 'react-query';
@@ -6,8 +6,10 @@ import { toast } from 'react-toastify';
 import { mui, yba, YBInputField } from '@yugabyte-ui-library/core';
 import { getGetUniverseQueryKey, useDeleteCluster } from '@app/v2/api/universe/universe';
 import { createErrorMessage } from '@app/utils/ObjectUtils';
+import { useDispatch } from 'react-redux';
+import { showTaskInDrawer } from '@app/actions/tasks';
 
-const { Box, Typography, Checkbox, FormControlLabel } = mui;
+const { Box, Typography } = mui;
 const { YBModal } = yba;
 
 type DeleteReadReplicaFormValues = {
@@ -33,11 +35,10 @@ export const DeleteReadReplicaModal: FC<DeleteReadReplicaModalProps> = ({
   clusterUuid,
   universeDisplayName
 }) => {
-  const [forceDelete, setForceDelete] = useState(false);
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const deleteClusterMutation = useDeleteCluster();
-
+  const dispatch = useDispatch();
   const {
     control,
     formState: { isValid },
@@ -51,7 +52,6 @@ export const DeleteReadReplicaModal: FC<DeleteReadReplicaModalProps> = ({
 
   const handleClose = () => {
     reset(DEFAULT_VALUES);
-    setForceDelete(false);
     onClose();
   };
 
@@ -63,12 +63,18 @@ export const DeleteReadReplicaModal: FC<DeleteReadReplicaModalProps> = ({
       await deleteClusterMutation.mutateAsync({
         uniUUID: universeUuid,
         clsUUID: clusterUuid,
-        params: { isForceDelete: forceDelete },
+        params: { isForceDelete: false },
         cUUID
-      });
-      await queryClient.invalidateQueries(getGetUniverseQueryKey(universeUuid, cUUID));
-      toast.success(t('universeForm.deleteClusterModal.deletionStarted'));
-      handleClose();
+      },
+      {
+        onSuccess: (response) => {
+          dispatch(showTaskInDrawer(response.task_uuid));
+          queryClient.invalidateQueries(getGetUniverseQueryKey(universeUuid, cUUID));
+          toast.success(t('universeForm.deleteClusterModal.deletionStarted'));
+          handleClose();
+        }
+      }
+    );
     } catch (e) {
       toast.error(createErrorMessage(e));
     }

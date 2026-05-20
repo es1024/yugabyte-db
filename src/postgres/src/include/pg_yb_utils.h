@@ -577,11 +577,14 @@ extern bool yb_enable_base_scans_cost_model;
 extern bool yb_enable_update_reltuples_after_create_index;
 
 /*
- * Enables index backfill column projection optimization.
- * If true, index build/backfill only reads columns needed for the index,
- * rather than all columns from the base table.
+ * Enables the following index backfill scan optimizations:
+ * - column projection (reads only the columns needed for the index)
+ * - predicate pushdown for partial indexes (pushes the predicate to DocDB)
+ * If true, index build/backfill reads only the columns needed for the index
+ * (column projection) and pushes partial index predicates down to the base table
+ * scan (predicate pushdown), reducing read RPCs.
  */
-extern bool yb_enable_index_backfill_column_projection;
+extern bool yb_enable_index_backfill_scan_optimization;
 
 /*
  * Total timeout for waiting for backends to have up-to-date catalog version.
@@ -632,6 +635,12 @@ extern int	yb_insert_on_conflict_read_batch_size;
  * Enable preloading of foreign key information into the relation cache.
  */
 extern bool yb_enable_fkey_catcache;
+
+/*
+ * Enable batched DocDB lookup for foreign key constraint check when types
+ * mismatch. The batch size is controlled by ysql_session_max_batch_size.
+ */
+extern bool yb_enable_fkey_batched_docdb_lookup_when_types_mismatch;
 
 /*
  * Enable the nop alter role statement optimization.
@@ -712,6 +721,15 @@ extern bool yb_force_catalog_update_on_next_ddl;
 
 /* If set to true, all drop commands will fail. */
 extern bool yb_test_fail_all_drops;
+
+/*
+ * If set to true, force invalidation of every base relation's index relcache
+ * entries between add_base_rels_to_query() and make_one_rel() in
+ * query_planner().  Used by tests to deterministically expose lazy-loading
+ * bugs where planner code reads relcache fields (e.g. rd_indexprs) that get
+ * reset by a mid-planning invalidation.
+ */
+extern bool yb_test_invalidate_relcache_in_planner;
 
 /*
  * If set to true, next increment catalog version operation will fail and
@@ -832,6 +850,11 @@ extern bool yb_enable_inplace_index_update;
  * Enable the advisory lock feature. (DEPRECATED)
  */
 extern bool yb_enable_advisory_locks;
+
+/*
+ * Toggle support for concurrent DDLs. (DEPRECATED)
+ */
+extern bool yb_enable_concurrent_ddl;
 
 /*
  * Enable invalidation messages.
@@ -1349,6 +1372,53 @@ bool		YbIsColumnPartOfKey(Relation rel, const char *column_name);
 /* Get a relation's split options. */
 YbOptSplit *YbGetSplitOptions(Relation rel);
 
+/*
+ * Convert split_points List to a string representation.
+ * The format is "((val1, val2), (val3, val4), ...)" where each inner
+ * parenthesized list is a split point.
+ * Returns NULL if split_points is NIL.
+ */
+char	   *YbSplitPointsToString(List *split_points);
+
+/*
+ * Parse a yb_presplit reloption string back to a YbOptSplit structure.
+ * The format can be:
+ *   - A number (e.g., "5") for SPLIT INTO N TABLETS
+ *   - Split points (e.g., "((100),(200))") for SPLIT AT VALUES
+ *   - A full SPLIT clause (e.g., "SPLIT INTO 5 TABLETS")
+ * Returns NULL if the string is NULL or empty.  Syntax errors are
+ * reported via ereport.
+ */
+YbOptSplit *YbParsePresplitString(const char *presplit_str);
+
+/*
+ * validate_cb for the yb_presplit string reloption.  Validates syntax by
+ * running the value through YbParsePresplitString.
+ */
+extern void YbValidatePresplitReloption(const char *value);
+
+/*
+ * Validate that a yb_presplit string is compatible with `rel`'s partitioning
+ * kind (hash vs range).  Caller is expected to have already validated syntax
+ * (e.g. via the reloption validate_cb).  ereport(ERROR) on mismatch.
+ */
+extern void YbValidatePresplitForRelation(Relation rel, const char *presplit_str);
+
+/*
+ * Convert a YbOptSplit structure to a yb_presplit reloption string.
+ * Returns NULL if split_options is NULL.
+ */
+char	   *YbSplitOptionsToPresplitString(YbOptSplit *split_options);
+
+/*
+ * Reconcile a statement's SPLIT clause and yb_presplit reloption so that both
+ * representations agree before the relation is created.  See the function
+ * comment in pg_yb_utils.c for the detailed contract.  Used by both CREATE
+ * TABLE and CREATE INDEX paths.
+ */
+extern void YbSyncSplitOptionsAndPresplit(YbOptSplit **split_options,
+										  List **options);
+
 #define HandleYBStatus(status) \
 	HandleYBStatusAtErrorLevel(status, ERROR)
 
@@ -1594,6 +1664,7 @@ typedef struct YbQpmConfiguration
 	int plan_format;
 	bool verbose_plans;
 	bool compress_text;
+	bool show_max_exec_params;
 } YbQpmConfiguration;
 
 extern YbQpmConfiguration yb_qpm_configuration;
@@ -1653,4 +1724,18 @@ extern YbTraceparentResult YbGetTraceparentFromTraceContext(const char *trace_co
 															size_t trace_context_len,
 															char *traceparent_out);
 
+/*
+ * Returns true if 'relid' is a foreign table whose foreign server has
+ * server_type = 'federatedYugabyteDB'.
+ */
+extern bool yb_is_federated_yb_foreign_table(Oid relid);
+
+struct PlannerInfo;
+extern void YbAddFederatedPartitionTserverUuid(struct PlannerInfo *root,
+											  Index rti,
+											  const char *tserver_uuid);
+extern const char *YbGetFederatedPartitionTserverUuid(const struct PlannerInfo *root,
+													  Index rti);
+
+extern void YbInvalidatePlannerRelcache(struct PlannerInfo *root);
 #endif							/* PG_YB_UTILS_H */

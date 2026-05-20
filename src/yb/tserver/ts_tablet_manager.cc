@@ -232,6 +232,9 @@ DEFINE_test_flag(int32, apply_tablet_split_inject_delay_ms, 0,
 DEFINE_test_flag(bool, pause_apply_tablet_split, false,
                  "Pause TSTabletManager::ApplyTabletSplit.");
 
+DEFINE_test_flag(bool, pause_after_ts_manager_started_quiescing, false,
+    "Pause TSTabletManager::StartShutdown after the tablet manager state is set.");
+
 DEFINE_test_flag(bool, skip_deleting_split_tablets, false,
                  "Skip deleting tablets which have been split.");
 
@@ -259,10 +262,7 @@ DEFINE_UNKNOWN_int32(read_pool_max_threads, 128,
              "to run multiple read operations, that are part of the same tablet rpc, "
              "in parallel.");
 
-DEFINE_UNKNOWN_int32(read_pool_max_queue_size, 128,
-             "The maximum number of tasks that can be held in the queue for read_pool_. This pool "
-             "is used to run multiple read operations, that are part of the same tablet rpc, "
-             "in parallel.");
+DEPRECATE_FLAG(int32, read_pool_max_queue_size, "05_2026");
 
 DEPRECATE_FLAG(int32, post_split_trigger_compaction_pool_max_threads, "02_2024");
 DEPRECATE_FLAG(int32, post_split_trigger_compaction_pool_max_queue_size, "02_2024");
@@ -273,11 +273,7 @@ DEFINE_NON_RUNTIME_int32(full_compaction_pool_max_threads, 1,
               "or after they have been split and still contain irrelevant data from the tablet "
               "they were sourced from.");
 
-DEFINE_NON_RUNTIME_int32(full_compaction_pool_max_queue_size, 500,
-             "The maximum number of tasks that can be held in the pool for "
-             "full_compaction_pool_. This pool is used to run full compactions on tablets "
-             "on a scheduled basis or after they have been split and still contain irrelevant data "
-             "from the tablet they were sourced from.");
+DEPRECATE_FLAG(int32, full_compaction_pool_max_queue_size, "05_2026");
 
 DEPRECATE_FLAG(int32, scheduled_full_compaction_check_interval_min, "02_2024");
 
@@ -306,8 +302,7 @@ DEFINE_NON_RUNTIME_uint32(deleted_tablet_cache_max_size, 10000,
     "Maximum size for the cache of recently deleted tablet ids. Used to "
     "reject remote bootstrap requests for recently deleted tablets.");
 
-DEFINE_RUNTIME_bool(
-    reject_rbs_for_deleted_tablet, true,
+DEFINE_RUNTIME_bool(reject_rbs_for_deleted_tablet, true,
     "Whether to reject a request to RBS a tablet that the receiving tserver has recently deleted.");
 
 DEFINE_UNKNOWN_int32(flush_bootstrap_state_pool_max_threads, -1,
@@ -339,6 +334,7 @@ DECLARE_int64(rocksdb_compact_flush_rate_limit_bytes_per_sec);
 DECLARE_string(rocksdb_compact_flush_rate_limit_sharing_mode);
 DECLARE_bool(qos_compaction_per_db_cgroups);
 DECLARE_bool(qos_consensus_per_db_cgroups);
+DECLARE_bool(qos_system_dbs_use_shared_pool);
 
 namespace yb::tserver {
 
@@ -572,7 +568,6 @@ TSTabletManager::TSTabletManager(FsManager* fs_manager,
       .run_time_us_stats = METRIC_op_read_run_time.Instantiate(server_->metric_entity())};
   CHECK_OK(ThreadPoolBuilder("read-parallel")
                .set_max_threads(FLAGS_read_pool_max_threads)
-               .set_max_queue_size(FLAGS_read_pool_max_queue_size)
                .set_metrics(std::move(read_metrics))
                .Build(&read_pool_));
   CHECK_OK(ThreadPoolBuilder("admin-compaction")
@@ -582,7 +577,6 @@ TSTabletManager::TSTabletManager(FsManager* fs_manager,
                .Build(&admin_triggered_compaction_pool_));
   CHECK_OK(ThreadPoolBuilder("full-compaction")
               .set_max_threads(FLAGS_full_compaction_pool_max_threads)
-              .set_max_queue_size(FLAGS_full_compaction_pool_max_queue_size)
               .set_metrics(THREAD_POOL_METRICS_INSTANCE(
                   server_->metric_entity(), full_compaction_pool))
               .Build(&full_compaction_pool_));
@@ -776,6 +770,18 @@ Status TSTabletManager::Init() {
   // Validator should be created before tablets are open.
   tablet_metadata_validator_ = std::make_unique<TabletMetadataValidator>(LogPrefix(), this);
 
+  // Switch state to MANAGER_RUNNING before opening tablets as apply of few ops might need the
+  // manager to be in running state.
+  {
+    std::lock_guard lock(mutex_);
+    allow_compaction_failures_for_tablet_ids_ = FLAGS_allow_compaction_failures_for_tablet_ids;
+    if (!allow_compaction_failures_for_tablet_ids_.empty()) {
+      LOG_WITH_PREFIX(INFO) << "Flag allow_compaction_failures_for_tablet_ids is set to: "
+                            << allow_compaction_failures_for_tablet_ids_;
+    }
+    state_ = MANAGER_RUNNING;
+  }
+
   // Now submit the "Open" task for each.
   {
     std::lock_guard lock(metas.ready_metas_mutex);
@@ -814,16 +820,6 @@ Status TSTabletManager::Init() {
         "bg superblock flush",
         MonoDelta::FromSeconds(bg_superblock_flush_interval_secs).ToChronoMilliseconds()));
     RETURN_NOT_OK(superblock_flush_bg_task_->Init());
-  }
-
-  {
-    std::lock_guard lock(mutex_);
-    allow_compaction_failures_for_tablet_ids_ = FLAGS_allow_compaction_failures_for_tablet_ids;
-    if (!allow_compaction_failures_for_tablet_ids_.empty()) {
-      LOG_WITH_PREFIX(INFO) << "Flag allow_compaction_failures_for_tablet_ids is set to: "
-                            << allow_compaction_failures_for_tablet_ids_;
-    }
-    state_ = MANAGER_RUNNING;
   }
 
   RETURN_NOT_OK(mem_manager_->Init());
@@ -1195,7 +1191,7 @@ Status TSTabletManager::ApplyTabletSplit(
     LOG(FATAL) << "Crashing due to FLAGS_TEST_crash_before_apply_tablet_split_op";
   }
 
-  if (state() != MANAGER_RUNNING) {
+  if (!IsOperational()) {
     return STATUS_FORMAT(IllegalState, "Manager is not running: $0", state());
   }
 
@@ -1532,7 +1528,7 @@ Status TSTabletManager::ApplyCloneTablet(
   // replicas A' and B' is maintained. Since the only way the clone op modifies the source tablet
   // is to set last_attempted_clone_seq_no_, this assumption is met.
 
-  if (state() != MANAGER_RUNNING) {
+  if (!IsOperational()) {
     return STATUS_FORMAT(IllegalState, "Manager is not running: $0", state());
   }
 
@@ -2039,17 +2035,24 @@ Status MaybeAssignPerDbCgroups(
     TabletPeer* tablet_peer, tablet::Tablet* tablet,
     const RaftGroupMetadata& meta, TServerCgroupManager* cm) {
   if (!cm) return Status::OK();
-  bool consensus_per_db = FLAGS_qos_consensus_per_db_cgroups;
-  bool compaction_per_db = FLAGS_qos_compaction_per_db_cgroups;
-  if (!consensus_per_db && !compaction_per_db) return Status::OK();
 
   if (meta.table_type() != PGSQL_TABLE_TYPE) return Status::OK();
   auto namespace_id = meta.namespace_id();
   if (namespace_id.empty()) return Status::OK();
 
   auto db_oid = VERIFY_RESULT(GetPgsqlDatabaseOid(namespace_id));
-  auto& cgroup = VERIFY_RESULT_REF(cm->CgroupForDb(db_oid));
+  if (FLAGS_qos_system_dbs_use_shared_pool && IsQosSystemDatabaseOid(db_oid)) {
+    return Status::OK();
+  }
+
+  // Register database name for metrics, regardless of per-DB cgroup flags.
   cm->RegisterDbName(db_oid, meta.namespace_name());
+
+  bool consensus_per_db = FLAGS_qos_consensus_per_db_cgroups;
+  bool compaction_per_db = FLAGS_qos_compaction_per_db_cgroups;
+  if (!consensus_per_db && !compaction_per_db) return Status::OK();
+
+  auto& cgroup = VERIFY_RESULT_REF(cm->CgroupForDb(db_oid));
   if (consensus_per_db) {
     tablet_peer->SetPerDbCgroup(&cgroup);
   }
@@ -2374,6 +2377,7 @@ void TSTabletManager::StartShutdown() {
   {
     std::lock_guard lock(mutex_);
     switch (state_) {
+      case MANAGER_STARTED_QUIESCING: [[fallthrough]];
       case MANAGER_QUIESCING: {
         VLOG(1) << "Tablet manager shut down already in progress..";
         return;
@@ -2384,8 +2388,8 @@ void TSTabletManager::StartShutdown() {
       }
       case MANAGER_INITIALIZING:
       case MANAGER_RUNNING: {
-        LOG_WITH_PREFIX(INFO) << "Shutting down tablet manager...";
-        state_ = MANAGER_QUIESCING;
+        LOG_WITH_PREFIX(INFO) << "Starting to shut down tablet manager...";
+        state_ = MANAGER_STARTED_QUIESCING;
         break;
       }
       default: {
@@ -2393,6 +2397,8 @@ void TSTabletManager::StartShutdown() {
       }
     }
   }
+
+  TEST_PAUSE_IF_FLAG(TEST_pause_after_ts_manager_started_quiescing);
 
   for (auto& callback : flag_callbacks_) {
     callback.Deregister();
@@ -2450,6 +2456,11 @@ void TSTabletManager::StartShutdown() {
   }
   if (metadata_cache_holder_) {
     metadata_cache_holder_->Shutdown();
+  }
+  {
+    std::lock_guard lock(mutex_);
+    LOG_WITH_PREFIX(INFO) << "Shutting down tablet manager...";
+    state_ = MANAGER_QUIESCING;
   }
 }
 
@@ -2543,7 +2554,15 @@ std::string TSTabletManager::TabletLogPrefix(const TabletId& tablet_id) const {
 }
 
 bool TSTabletManager::ClosingUnlocked() const {
+  // Don't check for MANAGER_STARTED_QUIESCING so as to allow apply of operations like SPLIT_OP &
+  // CLONE_OP that could race with the shutdown process, and could fatal if TSTabletManager is
+  // unable to apply them.
   return state_ == MANAGER_QUIESCING || state_ == MANAGER_SHUTDOWN;
+}
+
+bool TSTabletManager::IsOperational() const {
+  SharedLock<RWMutex> shared_lock(mutex_);
+  return state_ == MANAGER_STARTED_QUIESCING || state_ == MANAGER_RUNNING;
 }
 
 Status TSTabletManager::RegisterTablet(const TabletId& tablet_id,

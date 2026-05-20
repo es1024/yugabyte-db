@@ -159,7 +159,7 @@ libraryDependencies ++= Seq(
   javaWs,
   filters,
   guice,
-  "org.postgresql" % "postgresql" % "42.5.6",
+  "org.postgresql" % "postgresql" % "42.7.11",
   "net.logstash.logback" % "logstash-logback-encoder" % "6.2",
   "ch.qos.logback" % "logback-classic" % "1.5.32",
   "org.codehaus.janino" % "janino" % "3.1.9",
@@ -170,7 +170,7 @@ libraryDependencies ++= Seq(
   "org.apache.httpcomponents.core5" % "httpcore5" % "5.2.4",
   "org.apache.httpcomponents.core5" % "httpcore5-h2" % "5.2.4",
   "org.apache.httpcomponents.client5" % "httpclient5" % "5.2.3",
-  "org.apache.mina" % "mina-core" % "2.2.4",
+  "org.apache.mina" % "mina-core" % "2.2.7",
   "org.flywaydb" %% "flyway-play" % "9.0.0",
   // https://github.com/YugaByte/cassandra-java-driver/releases
   "com.yugabyte" % "java-driver-core" % "4.15.0-yb-3",
@@ -213,8 +213,8 @@ libraryDependencies ++= Seq(
   "org.glassfish.jaxb" % "jaxb-runtime" % "2.3.2",
   // pac4j and nimbusds libraries need to be upgraded together.
   "org.pac4j" %% "play-pac4j" % "11.0.0-PLAY2.8",
-  "org.pac4j" % "pac4j-oauth" % "5.7.7" exclude("commons-io" , "commons-io"),
-  "org.pac4j" % "pac4j-oidc" % "5.7.7"  exclude("commons-io" , "commons-io"),
+  "org.pac4j" % "pac4j-oauth" % "5.7.10" exclude("commons-io" , "commons-io"),
+  "org.pac4j" % "pac4j-oidc" % "5.7.10"  exclude("commons-io" , "commons-io"),
   "com.nimbusds" % "nimbus-jose-jwt" % "10.8",
   "com.nimbusds" % "oauth2-oidc-sdk" % "11.34",
   "commons-validator" % "commons-validator" % "1.10.0",
@@ -284,7 +284,7 @@ libraryDependencies ++= Seq(
   "io.grpc" % "grpc-inprocess" % "1.67.1" % Test,
   "io.zonky.test" % "embedded-postgres" % "2.0.1" % Test,
   "org.springframework" % "spring-test" % "5.3.9" % Test,
-  "com.yugabyte" % "yba-client-v2" % "1.0.1" % Test,
+  "com.yugabyte" % "yba-client-v2" % "1.0.2" % Test,
 )
 
 // Clear default resolvers.
@@ -379,6 +379,7 @@ externalResolvers := {
   versionGenerate.value
   compileYbaCliBinary.value
   downloadThirdPartyDeps.value
+  releaseModulesLocally.value
 }
 
 clean := (clean dependsOn cleanV2ServerStubs).value
@@ -450,7 +451,7 @@ buildDependentArtifacts / fileInputs += baseDirectory.value.toGlob /
   "node-agent/**"
 buildDependentArtifacts / fileInputExcludeFilter :=
   ((path: java.nio.file.Path, attributes: FileAttributes) => {
-    ".*(generated|target|third-party|pywheels|build|version_metadata).*".r.pattern.matcher(path.toString).matches
+    ".*(generated|target|third-party|build|version_metadata).*".r.pattern.matcher(path.toString).matches
    })
 buildDependentArtifacts := {
   (Compile / openApiProcessServer).value
@@ -712,7 +713,7 @@ lazy val javaGenV2Client = project.in(file("client/java"))
     openApiConfigFile := "client/java/openapi-java-config-v2.json",
     openApiGlobalProperties += ("skipFormModel" -> "false"),
     openApiTemplateDir := (baseDirectory.value / resDir / "openapi_templates/clients/v2").absolutePath,
-    version := "1.0.1",
+    version := "1.0.2",
     target := file("client/java/target/v2"),
   )
 
@@ -1032,9 +1033,9 @@ libraryDependencies ++= Seq(
 
 
 dependencyOverrides += "org.reflections" % "reflections" % "0.10.2"
-dependencyOverrides += "io.netty" % "netty-all" % "4.1.132.Final"
-dependencyOverrides += "io.netty" % "netty-codec-http" % "4.1.132.Final"
-dependencyOverrides += "io.netty" % "netty-codec-http2" % "4.1.132.Final"
+dependencyOverrides += "io.netty" % "netty-all" % "4.1.133.Final"
+dependencyOverrides += "io.netty" % "netty-codec-http" % "4.1.133.Final"
+dependencyOverrides += "io.netty" % "netty-codec-http2" % "4.1.133.Final"
 
 // Following library versions for jersey, jakarta glassfish, jakarta ws.rs and
 // jackson-module-jaxb-annotations are needed by the openapi java client. The

@@ -680,9 +680,9 @@ Enables derivation of additional equalities for columns that are generated or co
 Default: `false`
 {{% /tags/wrap %}}
 
-Enable derivation of IN clauses for columns generated or computed using a `yb_hash_code` expression. Such derivation is only done for index paths that consider bucket-based merge. Disabled if `yb_max_saop_merge_streams` is 0.
+Enable derivation of IN clauses for columns generated or computed using a `yb_hash_code` expression. Such derivation is only done for index paths that consider bucket-based merge. Disabled if `yb_max_merge_scan_streams` is 0.
 
-##### yb_max_saop_merge_streams
+##### yb_max_merge_scan_streams
 
 {{% tags/wrap %}}
 {{<tags/feature/ea idea="2275">}}
@@ -690,6 +690,16 @@ Default: `0`
 {{% /tags/wrap %}}
 
 Maximum number of buckets to process in parallel. A value greater than 0 enables bucket-based merge (used for [bucket-based indexes](../../../develop/data-modeling/bucket-based-index-ysql/)). Disabled if the cost-based optimizer is not enabled (`yb_enable_cbo=false`). Recommended value is 64.
+
+##### yb_max_saop_merge_streams
+
+{{% tags/wrap %}}
+{{<tags/feature/deprecated>}}
+{{<tags/feature/ea idea="2275">}}
+Default: `0`
+{{% /tags/wrap %}}
+
+Deprecated in v2025.2.3.0. Use [yb_max_merge_scan_streams](#yb-max-merge-scan-streams) instead.
 
 ## Networking
 
@@ -1360,6 +1370,37 @@ Default: `4 * 3600` (4 hours)
 
 The time interval, in seconds, to retain history/older versions of the system catalog.
 
+### LISTEN/NOTIFY flags
+
+{{<tags/feature/ea idea="1901">}}Available in v2025.2.3 and later. To learn about LISTEN/NOTIFY, see [LISTEN, NOTIFY, and UNLISTEN](../../../api/ysql/the-sql-language/statements/cmd_listen_notify/).
+
+##### --ysql_yb_enable_listen_notify
+
+{{% tags/wrap %}}
+{{<tags/feature/t-server>}}
+Default: `false`
+{{% /tags/wrap %}}
+
+Enables YSQL LISTEN/NOTIFY.
+
+##### --ysql_yb_notifications_poll_sleep_duration_nonempty_ms
+
+{{% tags/wrap %}}
+
+Default: `1`
+{{% /tags/wrap %}}
+
+Wait time in milliseconds before the notifications poller polls again when the previous poll returned data.
+
+##### --ysql_yb_notifications_poll_sleep_duration_empty_ms
+
+{{% tags/wrap %}}
+
+Default: `100`
+{{% /tags/wrap %}}
+
+Wait time in milliseconds before the notifications poller polls again when the previous poll returned no data.
+
 ### File expiration based on TTL flags
 
 ##### --tablet_enable_ttl_file_filter
@@ -1899,15 +1940,6 @@ Default: `1`
 {{% /tags/wrap %}}
 
 The maximum number of threads allowed for non-admin full compactions. This includes post-split compactions (compactions that remove irrelevant data from new tablets after splits) and scheduled full compactions.
-
-##### --full_compaction_pool_max_queue_size
-
-{{% tags/wrap %}}
-{{<tags/feature/restart-needed>}}
-Default: `500`
-{{% /tags/wrap %}}
-
-The maximum number of full compaction tasks that can be queued simultaneously. This includes post-split compactions (compactions that remove irrelevant data from new tablets after splits) and scheduled full compactions.
 
 ##### --auto_compact_check_interval_sec
 

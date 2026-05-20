@@ -90,8 +90,7 @@ DECLARE_bool(ysql_enable_concurrent_ddl);
 
 DEPRECATE_FLAG(bool, ysql_disable_per_tuple_memory_context_in_update_relattrs, "06_2023");
 
-DEFINE_RUNTIME_PG_FLAG(
-    bool, yb_user_ddls_preempt_auto_analyze, true,
+DEFINE_RUNTIME_PG_FLAG(bool, yb_user_ddls_preempt_auto_analyze, true,
     "If object locking is off (i.e., enable_object_locking_for_table_locks=false), concurrent "
     "DDLs might face a conflict error on the catalog version increment at the end after doing all "
     "the work. Setting this flag enables a fail-fast strategy by locking the catalog version at "
@@ -3385,32 +3384,24 @@ YbcFlushDebugContext YBCMakeFlushDebugContextEndOfTopLevelStmt() {
 // PgGlobalViewRead C API wrappers
 // ---------------------------------------------------------------------------
 
-YbcStatus YBCPgNewGlobalViewRead(const char* database_name, YbcPgGlobalViewRead* handle) {
-  return ToYBCStatus(pgapi->NewGlobalViewRead(database_name, handle));
-}
-
-void YBCPgGlobalViewReadResetScan(YbcPgGlobalViewRead handle) {
-  handle->ResetScan();
+YbcStatus YBCPgNewGlobalViewRead(YbcPgGlobalViewRead* handle) {
+  return ToYBCStatus(pgapi->NewGlobalViewRead(handle));
 }
 
 void YBCPgGlobalViewReadSetParams(
     YbcPgGlobalViewRead handle, int num_params, const char** param_values) {
   DCHECK(param_values);
-  handle->SetParams(std::span{param_values, param_values + num_params});
+  DCHECK_NOTNULL(handle)->SetParams(std::span{param_values, param_values + num_params});
 }
 
-YbcRemotePgExecResult YBCPgGlobalViewReadExecScan(YbcPgGlobalViewRead handle, const char *query) {
-  return pgapi->Exec(handle, query);
+YbcRemotePgExecResult YBCPgGlobalViewReadExecScan(
+    YbcPgGlobalViewRead handle, const char *database_name, const char *query,
+    const char *tserver_uuid) {
+  return pgapi->ExecGlobalViewScan(handle, database_name, query, tserver_uuid);
 }
 
 void YBCPgGlobalViewReadDestroy(YbcPgGlobalViewRead handle) {
-  if (handle) {
-    PgMemctx::Destroy(handle);
-  }
-}
-
-bool YBCPgGlobalViewReadIsEof(YbcPgGlobalViewRead handle) {
-  return handle->is_eof();
+  PgMemctx::Destroy(DCHECK_NOTNULL(handle));
 }
 
 } // extern "C"

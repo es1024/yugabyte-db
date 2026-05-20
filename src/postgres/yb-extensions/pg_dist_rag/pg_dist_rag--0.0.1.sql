@@ -27,7 +27,7 @@ CREATE TABLE dist_rag.sources (
 );
 
 CREATE TYPE dist_rag.ai_provider_enum AS ENUM (
-  'OPENAI', 'LOCAL'
+  'OPENAI', 'LOCAL', 'AWS_BEDROCK'
 );
 
 CREATE TYPE dist_rag.index_build_status AS ENUM (

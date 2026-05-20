@@ -41,6 +41,7 @@ import ReplicaIcon from '@app/redesign/assets/copy.svg';
 import ClusterIcon from '@app/redesign/assets/clusters.svg';
 
 import { createErrorMessage } from '@app/redesign/features/universe/universe-form/utils/helpers';
+import { getReadReplicaExitRoute } from '../../../readReplicaUtils';
 
 const { Box } = mui;
 
@@ -294,7 +295,7 @@ export const RRReviewAndSummary = forwardRef<StepsRef>((_, forwardRef) => {
   ]);
 
   const redirectToUniverse = useCallback(() => {
-    window.location.href = `/universes/${universeUuid}`;
+    window.location.href = getReadReplicaExitRoute(universeUuid);
   }, [universeUuid]);
 
   const runSubmitMutation = useCallback(

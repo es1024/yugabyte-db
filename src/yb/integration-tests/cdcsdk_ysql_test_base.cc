@@ -2705,6 +2705,30 @@ void CDCSDKYsqlTest::VerifyTablesAndStateInStreamMetadata(
       MonoDelta::FromSeconds(30), timeout_msg));
 }
 
+Status CDCSDKYsqlTest::VerifyOriginIdOnAllRecords(
+    const GetChangesResponsePB& resp, uint32_t expected_origin_id) {
+  for (const auto& record : resp.cdc_sdk_proto_records()) {
+    auto op = record.row_message().op();
+    if (op != RowMessage::BEGIN && op != RowMessage::INSERT && op != RowMessage::UPDATE &&
+        op != RowMessage::DELETE && op != RowMessage::COMMIT) {
+      continue;
+    }
+    if (expected_origin_id != 0) {
+      SCHECK(
+          record.row_message().has_xrepl_origin_id(), IllegalState,
+          Format("Missing xrepl_origin_id on op=$0", RowMessage::Op_Name(op)));
+      SCHECK_EQ(
+          record.row_message().xrepl_origin_id(), expected_origin_id, IllegalState,
+          Format("Wrong xrepl_origin_id on op=$0", RowMessage::Op_Name(op)));
+    } else {
+      SCHECK(
+          !record.row_message().has_xrepl_origin_id(), IllegalState,
+          Format("Expected no xrepl_origin_id on op=$0", RowMessage::Op_Name(op)));
+    }
+  }
+  return Status::OK();
+}
+
 void CDCSDKYsqlTest::VerifyTabletIdsInCdcStateForStream(
     const xrepl::StreamId& stream_id,
     const std::unordered_set<TabletId>& expected_tablet_ids,
@@ -3866,6 +3890,7 @@ void CDCSDKYsqlTest::CDCSDKAlterWithSysCatalogCompaction(bool packed_row) {
   const uint32_t num_tablets = 1;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_level0_file_num_compaction_trigger) = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdc_enable_dynamic_schema_changes) = false;
 
   auto table = ASSERT_RESULT(CreateTable(
       &test_cluster_, kNamespaceName, kTableName, num_tablets, true, false, 0, false, "",
@@ -3875,6 +3900,10 @@ void CDCSDKYsqlTest::CDCSDKAlterWithSysCatalogCompaction(bool packed_row) {
   ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, /* partition_list_version =*/nullptr));
   ASSERT_EQ(tablets.size(), num_tablets);
   auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(kNamespaceName));
+
+  xrepl::StreamId stream_id = ASSERT_RESULT(CreateDBStream(IMPLICIT));
+  auto resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
+  ASSERT_FALSE(resp.has_error());
 
   // Insert some records in transaction.
   ASSERT_OK(WriteRows(1 /* start */, 101 /* end */, &test_cluster_, {kValue2ColumnName}));
@@ -3897,10 +3926,6 @@ void CDCSDKYsqlTest::CDCSDKAlterWithSysCatalogCompaction(bool packed_row) {
 
   CHECK_OK(ASSERT_RESULT(test_cluster()->mini_master(0)->tablet_peer()->shared_tablet())
                 ->ForceManualRocksDBCompact());
-
-  xrepl::StreamId stream_id = ASSERT_RESULT(CreateDBStream(IMPLICIT));
-  auto resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
-  ASSERT_FALSE(resp.has_error());
 
   GetChangesResponsePB change_resp;
   auto result = GetChangesFromCDC(stream_id, tablets);

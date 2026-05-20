@@ -44,6 +44,7 @@
 #include "yb/consensus/log.h"
 #include "yb/consensus/log_reader.h"
 #include "yb/consensus/log_util.h"
+#include "yb/consensus/raft_consensus.h"
 
 #include "yb/gutil/casts.h"
 #include "yb/gutil/ref_counted.h"
@@ -83,8 +84,7 @@ using namespace std::literals;
     } \
   } while (false)
 
-DEFINE_RUNTIME_AUTO_uint64_DO_NOT_USE(
-    remote_bootstrap_idle_timeout_ms, kLocalVolatile,
+DEFINE_RUNTIME_AUTO_uint64_DO_NOT_USE(remote_bootstrap_idle_timeout_ms, kLocalVolatile,
     static_cast<uint64_t>(2 * yb::MonoTime::kMillisecondsPerHour),
     static_cast<uint64_t>(3 * yb::MonoTime::kMillisecondsPerMinute),
     "Amount of time without activity before a remote bootstrap session which hasn't yet fetched "
@@ -114,8 +114,7 @@ DEFINE_test_flag(uint64, delay_end_rbs_session_ms, 0,
 DEFINE_test_flag(uint64, inject_latency_before_fetch_data_secs, 0,
                  "Number of seconds to sleep before we call FetchData.");
 
-DEFINE_test_flag(
-    double, fault_crash_on_rbs_anchor_register, 0.0,
+DEFINE_test_flag(double, fault_crash_on_rbs_anchor_register, 0.0,
     "Fraction of the time when the peer will crash while "
     "servicing a RemoteBootstrapServiceImpl::RegisterLogAnchor() RPC call.");
 
@@ -464,6 +463,17 @@ Result<scoped_refptr<RemoteBootstrapSession>> RemoteBootstrapServiceImpl::Create
   if (!s.ok()) {
     *error_code = RemoteBootstrapErrorPB::TABLET_NOT_FOUND;
     return STATUS(NotFound, Substitute("Tablet is not running yet: $0", tablet_id));
+  }
+  auto raft_consensus = tablet_peer->GetRaftConsensus();
+  if (!raft_consensus.ok()) {
+    *error_code = RemoteBootstrapErrorPB::TABLET_NOT_FOUND;
+    return STATUS_FORMAT(
+        NotFound, "Can't get tablet $0 Raft consensus: $1", tablet_id, raft_consensus.status());
+  }
+  s = raft_consensus.get()->CheckReadyAsRbsSource();
+  if (!s.ok()) {
+    *error_code = RemoteBootstrapErrorPB::NOT_READY_AS_RBS_SOURCE;
+    return STATUS_FORMAT(TryAgain, "Tablet $0 is not ready as RBS source: $1", tablet_id, s);
   }
 
   scoped_refptr<RemoteBootstrapSession> session;

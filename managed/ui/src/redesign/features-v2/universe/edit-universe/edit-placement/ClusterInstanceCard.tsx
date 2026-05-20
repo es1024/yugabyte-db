@@ -5,6 +5,7 @@ import EditIcon from '@app/redesign/assets/edit2.svg';
 import { KeyboardArrowDown } from '@material-ui/icons';
 import { useTranslation } from 'react-i18next';
 import {
+  ClusterPartitionSpec,
   ClusterPlacementSpec,
   ClusterSpec,
   ClusterSpecClusterType,
@@ -12,11 +13,12 @@ import {
   PlacementRegion
 } from '@app/v2/api/yugabyteDBAnywhereV2APIs.schemas';
 import {
-  countMasterAndTServerNodes,
   countMasterAndTServerNodesByPlacementRegion,
   countRegionsAzsAndNodes,
+  countMasterNodesInAz,
+  getDedicatedCountsForPlacementRegion,
+  getDedicatedTserverMasterDisplayCounts,
   getResilientType,
-  hasDedicatedNodes,
   useEditUniverseContext
 } from '../EditUniverseUtils';
 import { getFlagFromRegion } from '../../create-universe/helpers/RegionToFlagUtils';
@@ -38,6 +40,7 @@ interface ClusterInstanceCardProps {
   editResilienceAndRegionsClicked?: () => void;
   editMasterServerNodeAllocationClicked?: () => void;
   cluster: ClusterSpec;
+  parition?: ClusterPartitionSpec;
   placement: ClusterPlacementSpec;
   /** When set, replaces the default three-item edit menu (primary / geo primary card). */
   editMenuItems?: ClusterInstanceCardEditMenuItem[];
@@ -70,31 +73,37 @@ export const ClusterInstanceCard: FC<ClusterInstanceCardProps> = ({
   editMasterServerNodeAllocationClicked,
   cluster,
   placement,
+  parition,
   editMenuItems
 }) => {
   const { t } = useTranslation('translation', { keyPrefix: 'editUniverse.placement' });
   const { universeData } = useEditUniverseContext();
   if (!universeData) return null;
   const regionStats = countRegionsAzsAndNodes(placement);
-  const resilientType = getResilientType(regionStats, t);
+  const resilientType = getResilientType(placement, parition?.replication_factor ?? cluster?.replication_factor, t);
   const isReadReplicaCluster = cluster.cluster_type === ClusterSpecClusterType.ASYNC;
-  const hasDedicatedTo = hasDedicatedNodes(universeData);
+  const dedicatedFromSpec = !!cluster.node_spec?.dedicated_nodes;
   const regionList = placement.cloud_list.map((cloud) => cloud.region_list).flat();
 
-  let dedicatedNodesCount: Partial<Record<NodeDetailsDedicatedTo, number>> = {
-    [NodeDetailsDedicatedTo.MASTER]: 0,
-    [NodeDetailsDedicatedTo.TSERVER]: 0
-  };
+  const dedicatedDisplayTotals = getDedicatedTserverMasterDisplayCounts(
+    universeData,
+    cluster,
+    placement ?? cluster.placement_spec!
+  );
 
-  if (hasDedicatedTo) {
-    dedicatedNodesCount = countMasterAndTServerNodes(
-      universeData,
-      placement ?? cluster.placement_spec!
-    );
-  }
   const countTotalNodes = (placementRegion: PlacementRegion) => {
-    if (hasDedicatedTo) {
-      return countMasterAndTServerNodesByPlacementRegion(universeData!, placementRegion, true, t);
+    if (dedicatedFromSpec) {
+      const { tserver, master } = getDedicatedCountsForPlacementRegion(
+        universeData!,
+        placementRegion,
+        cluster
+      );
+      return t('totalNodesTServerMaster', {
+        total_nodes: tserver + master,
+        tservers: tserver,
+        masters: master,
+        keyPrefix: 'editUniverse.placement'
+      });
     }
 
     let totalNodes = 0;
@@ -106,38 +115,42 @@ export const ClusterInstanceCard: FC<ClusterInstanceCardProps> = ({
 
   const renderExpandDetails = ({ row }: any) => {
     const placementRegion: PlacementRegion = row.original;
-    const masterTserverCount: any = countMasterAndTServerNodesByPlacementRegion(
-      universeData!,
-      placementRegion,
-      false,
-      t
-    );
+
+    if (!dedicatedFromSpec) {
+      return (
+        <YBTable
+          columns={[{ accessorKey: 'name', header: t('availabilityZone') }, { accessorKey: 'num_nodes_in_az', header: t('noOfNodes') }]}
+          data={((placementRegion.az_list as unknown) as Record<string, string>[]) ?? []}
+          withBorder={false}
+          options={{
+            pagination: false
+          }}
+        />
+      );
+    }
 
     return (
       <YBTable
         columns={[
           { accessorKey: 'name', header: t('availabilityZone') },
-          ...(!hasDedicatedTo
-            ? [{ accessorKey: 'num_nodes_in_az', header: t('noOfNodes') }]
-            : [
-                {
-                  accessorKey: 'tServers',
-                  header: t('tServers'),
-                  Cell: () => masterTserverCount[NodeDetailsDedicatedTo.TSERVER]! ?? 0
-                },
-                {
-                  accessorKey: 'masters',
-                  header: t('masters'),
-                  Cell: () => masterTserverCount[NodeDetailsDedicatedTo.MASTER]! ?? 0
-                }
-              ])
+          {
+            accessorKey: 'tServers',
+            header: t('tServers'),
+            Cell: ({ row: azRow }: any) => azRow.original?.num_nodes_in_az ?? 0
+          },
+          {
+            accessorKey: 'masters',
+            header: t('masters'),
+            Cell: ({ row: azRow }: any) =>
+              countMasterNodesInAz(universeData!, azRow.original?.uuid)
+          }
         ]}
         data={((placementRegion.az_list as unknown) as Record<string, string>[]) ?? []}
         withBorder={false}
         options={{
           pagination: false
         }}
-      ></YBTable>
+      />
     );
   };
 
@@ -264,16 +277,20 @@ export const ClusterInstanceCard: FC<ClusterInstanceCardProps> = ({
                   {<EditIcon />}
                   {t('editNodesAndAvailabilityZones')}
                 </MenuItem>,
-                <MenuItem
-                  key="master-alloc"
-                  data-test-id="edit-placement-clear-affinities"
-                  onClick={() => {
-                    editMasterServerNodeAllocationClicked?.();
-                  }}
-                >
-                  {<EditIcon />}
-                  {t('editMasterServerNodeAllocation')}
-                </MenuItem>
+                ...(editMasterServerNodeAllocationClicked
+                  ? [
+                      <MenuItem
+                        key="master-alloc"
+                        data-test-id="edit-placement-clear-affinities"
+                        onClick={() => {
+                          editMasterServerNodeAllocationClicked();
+                        }}
+                      >
+                        {<EditIcon />}
+                        {t('editMasterServerNodeAllocation')}
+                      </MenuItem>
+                    ]
+                  : [])
               ]}
         </YBDropdown>
       </Box>
@@ -290,7 +307,7 @@ export const ClusterInstanceCard: FC<ClusterInstanceCardProps> = ({
               <Typography variant="subtitle1" color="textSecondary">
                 {t('replicationFactor')}
               </Typography>
-              <StyledValue>{cluster?.replication_factor ?? '-'}</StyledValue>
+              <StyledValue>{ parition?.replication_factor ?? cluster?.replication_factor ?? '-'}</StyledValue>
             </div>
           </>
         )}
@@ -299,13 +316,12 @@ export const ClusterInstanceCard: FC<ClusterInstanceCardProps> = ({
             {t('totalNodes')}
           </Typography>
           <StyledValue>
-            {hasDedicatedTo
+            {dedicatedFromSpec
               ? t('totalNodesTServerMaster', {
-                  total_nodes:
-                    dedicatedNodesCount[NodeDetailsDedicatedTo.TSERVER]! +
-                    dedicatedNodesCount[NodeDetailsDedicatedTo.MASTER]!,
-                  tservers: dedicatedNodesCount[NodeDetailsDedicatedTo.TSERVER] ?? 0,
-                  masters: dedicatedNodesCount[NodeDetailsDedicatedTo.MASTER] ?? 0
+                  total_nodes: dedicatedDisplayTotals.tserver + dedicatedDisplayTotals.master,
+                  tservers: dedicatedDisplayTotals.tserver,
+                  masters: dedicatedDisplayTotals.master,
+                  keyPrefix: 'editUniverse.placement'
                 })
               : regionStats.totalNodes}
           </StyledValue>

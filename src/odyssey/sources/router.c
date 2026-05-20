@@ -38,19 +38,24 @@ void od_router_init(od_router_t *router, od_global_t *global)
 
 	router->router_err_logger = od_err_logger_create_default();
 	router->yb_max_logical_client_version = 0;
+	router->yb_backends_in_use = 0;
 }
 
 static inline int od_router_immed_close_server_cb(od_server_t *server,
 						  void **argv)
 {
 	od_route_t *route = server->route;
-	/* remove server for server pool */
-	od_pg_server_pool_set(&route->server_pool, server, OD_SERVER_UNDEF);
 
 	server->route = NULL;
 	od_backend_close_connection(server);
 	od_backend_close(server);
 
+	/*
+	 * YB: Always close connection before removing server from pool
+	 * to ensure PGPROC slot is released
+	 */
+	/* remove server for server pool */
+	od_pg_server_pool_set(&route->server_pool, server, OD_SERVER_UNDEF);
 	return 0;
 }
 
@@ -868,36 +873,6 @@ static uint32_t yb_count_all_active_routes(od_router_t *router, od_route_t *curr
 }
 
 /*
- * Calculate the number of in_use backends (aka physical connection) across all
- * routes.
- *
- * IMPORTANT: The caller must not hold any locks on any of the routes.
- */
-static uint32_t yb_calculate_all_in_use_backends(od_router_t *router) {
-	od_router_lock(router);
-
-	od_route_pool_t *pool = &router->route_pool;
-	od_list_t *i;
-	uint32_t total_in_use_backends = 0;
-	od_list_foreach(&pool->list, i)
-	{
-		od_route_t *route;
-		route = od_container_of(i, od_route_t, link);
-
-		if (yb_is_route_invalid(route) ||
-			(route->id.logical_rep))
-			continue;
-
-		od_route_lock(route);
-		total_in_use_backends += od_server_pool_total(&route->server_pool);
-		od_route_unlock(route);
-	}
-
-	od_router_unlock(router);
-	return total_in_use_backends;
-}
-
-/*
  * Return an idle server to close from a route different from the current route.
  * The route must be exceeding the per_route_quota.
  * Returns NULL if no such route is found.
@@ -951,6 +926,56 @@ static od_server_t *yb_get_idle_server_to_close(od_router_t *router,
 }
 
 /*
+ * YB: Backend slot claim/release helpers.
+ *
+ * These use a lockless atomic counter (yb_backends_in_use) on od_router_t to
+ * enforce the yb_ysql_max_connections limit across all routes.
+ */
+bool yb_try_claim_backend_slot(od_router_t *router)
+{
+	od_instance_t *instance = router->global->instance;
+	if (!instance->config.yb_enable_multi_route_pool)
+		return true;
+	uint32_t prev = od_atomic_u32_inc(&router->yb_backends_in_use);
+	if (prev >= (uint32_t)instance->config.yb_ysql_max_connections) {
+		od_atomic_u32_dec(&router->yb_backends_in_use);
+		od_debug(&instance->logger, "yb-backend-slot", NULL, NULL,
+			 "try_claim FAILED: prev=%u, max=%d, after_rollback=%u",
+			 prev, instance->config.yb_ysql_max_connections,
+			 od_atomic_u32_of(&router->yb_backends_in_use));
+		return false;
+	}
+	od_debug(&instance->logger, "yb-backend-slot", NULL, NULL,
+		 "try_claim OK: prev=%u, now=%u, max=%d", prev,
+		 od_atomic_u32_of(&router->yb_backends_in_use),
+		 instance->config.yb_ysql_max_connections);
+	return true;
+}
+
+void yb_force_claim_backend_slot(od_router_t *router)
+{
+	od_instance_t *instance = router->global->instance;
+	if (instance->config.yb_enable_multi_route_pool) {
+		uint32_t prev = od_atomic_u32_inc(&router->yb_backends_in_use);
+		od_debug(&instance->logger, "yb-backend-slot", NULL, NULL,
+			 "claim (unconditional): prev=%u, now=%u", prev,
+			 od_atomic_u32_of(&router->yb_backends_in_use));
+	}
+}
+
+void yb_release_backend_slot(od_router_t *router)
+{
+	od_instance_t *instance = router->global->instance;
+	if (instance->config.yb_enable_multi_route_pool) {
+		uint32_t prev_use =
+			od_atomic_u32_dec(&router->yb_backends_in_use);
+		od_debug(&instance->logger, "yb-backend-slot", NULL, NULL,
+			 "release: use prev=%u now=%u", prev_use,
+			 od_atomic_u32_of(&router->yb_backends_in_use));
+	}
+}
+
+/*
  * od_router_attach is a function used to attach a client object to a server object.
  * client_for_router represents the internal client used for
  * route matching and server attachment. On the other hand,
@@ -988,6 +1013,7 @@ od_router_status_t od_router_attach(od_router_t *router,
 	od_server_t *server;
 	int busyloop_sleep = 0;
 	int busyloop_retry = 0;
+	bool yb_slot_claimed = false;
 
 	const char *is_warmup_needed_flag = getenv("YB_YSQL_CONN_MGR_DOWARMUP_ALL_POOLS_MODE");
 	bool is_warmup_needed = false;
@@ -1090,17 +1116,6 @@ od_router_status_t od_router_attach(od_router_t *router,
 						       ->server_max_routing;
 
 			bool yb_is_slot_available = false;
-			if (instance->config.yb_enable_multi_route_pool) {
-				od_route_unlock(route);
-				uint32_t yb_total_acquired_slots =
-					yb_calculate_all_in_use_backends(router);
-				od_route_lock(route);
-				yb_is_slot_available =
-					yb_total_acquired_slots < (uint32_t) instance->config.yb_ysql_max_connections;
-			} else {
-				yb_is_slot_available = pool_size == 0 ||
-					connections_in_pool < pool_size;
-			}
 
 			// For replication connection, PG has a different pool from ysql connections.
 			// Replication connections are not detached after txn is committed similar to sticky
@@ -1109,6 +1124,14 @@ od_router_status_t od_router_attach(od_router_t *router,
 			// postgres take care of the limits on number of backend connections.
 			if (route->id.logical_rep) {
 				yb_is_slot_available = true;
+			} else if (instance->config.yb_enable_multi_route_pool) {
+				/* YB: Atomically claim a backend slot for the multi-route pool limit */
+				yb_is_slot_available =
+					yb_try_claim_backend_slot(router);
+				yb_slot_claimed = yb_is_slot_available;
+			} else {
+				yb_is_slot_available = pool_size == 0 ||
+					connections_in_pool < pool_size;
 			}
 
 			if (yb_is_slot_available) {
@@ -1120,6 +1143,10 @@ od_router_status_t od_router_attach(od_router_t *router,
 						(instance->config.yb_enable_multi_route_pool) ? 0 : pool_size,
 					    (int)currently_routing,
 					    (int)max_routing)) {
+					if (yb_slot_claimed) {
+						yb_release_backend_slot(router);
+						yb_slot_claimed = false;
+					}
 					// concurrent server connection in progress.
 					od_route_unlock(route);
 					machine_sleep(busyloop_sleep);
@@ -1155,11 +1182,24 @@ od_router_status_t od_router_attach(od_router_t *router,
 				if (idle_server) {
 					// Close the server and make space for ourselves.
 					od_route_t *idle_route = idle_server->route;
+					/*
+					 * YB: Transfer slot from idle server to new server. To do
+					 * this, we set `yb_slot_claimed` of the idle server to true
+					 * so it doesn't decrement the global counter on exit and this
+					 * slot is then taken to be transferred to the new server
+					 */
+					idle_server->yb_slot_claimed = false;
+					yb_slot_claimed = true;
+
+					/*
+					 * Close the connection first so that we attempt to make a
+					 * new connection only when PGPROC slot has been released
+					 */
+					od_backend_close_connection(idle_server);
 					od_pg_server_pool_set(&idle_route->server_pool,
 							      idle_server,
 							      OD_SERVER_UNDEF);
 					idle_server->route = NULL;
-					od_backend_close_connection(idle_server);
 					od_backend_close(idle_server);
 					od_route_unlock(idle_route);
 
@@ -1207,14 +1247,29 @@ od_router_status_t od_router_attach(od_router_t *router,
 	while (is_warmup_needed &&
 		  (od_server_pool_total(&route->server_pool) < route->rule->min_pool_size))
 	{
+		/*
+		 * YB: Claim additional backend slots for warmup servers after the first
+		 * (the initial yb_try_claim_backend_slot covers the first).
+		 */
+		if (created_atleast_one) {
+			yb_force_claim_backend_slot(router);
+			yb_slot_claimed = true;
+		}
 		server = od_server_allocate(
 		route->rule->pool->reserve_prepared_statement);
-		if (server == NULL)
+		if (server == NULL) {
+			if (yb_slot_claimed) {
+				yb_release_backend_slot(router);
+				yb_slot_claimed = false;
+			}
 			return OD_ROUTER_ERROR;
+		}
 		od_id_generate(&server->id, "s");
 		server->global = client_for_router->global;
 		server->route = route;
 		server->client = NULL;
+		server->yb_slot_claimed = yb_slot_claimed;
+		yb_slot_claimed = false;
 		od_pg_server_pool_set(&route->server_pool, server,
 						OD_SERVER_IDLE);
 		created_atleast_one = true;
@@ -1232,11 +1287,18 @@ od_router_status_t od_router_attach(od_router_t *router,
 
 	server = od_server_allocate(
 		route->rule->pool->reserve_prepared_statement);
-	if (server == NULL)
+	if (server == NULL) {
+		if (yb_slot_claimed) {
+			yb_release_backend_slot(router);
+			yb_slot_claimed = false;
+		}
 		return OD_ROUTER_ERROR;
+	}
 	od_id_generate(&server->id, "s");
 	server->global = client_for_router->global;
 	server->route = route;
+	server->yb_slot_claimed = yb_slot_claimed;
+	yb_slot_claimed = false;
 
 	od_route_lock(route);
 

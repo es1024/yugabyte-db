@@ -37,6 +37,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -151,8 +152,7 @@ using TabletToTabletServerMap = std::unordered_map<TabletId, TabletServerId>;
 
 using TableToTabletInfos = std::unordered_map<TableId, std::vector<TabletInfoPtr>>;
 
-YB_DEFINE_ENUM(
-    CDCSDKStreamCreationState,
+YB_DEFINE_ENUM(CDCSDKStreamCreationState,
     // Stream has been initialized but no in-memory data structures or sys-catalog have been
     // modified.
     (kInitialized)
@@ -187,8 +187,7 @@ YB_DEFINE_ENUM(YsqlDdlSubTransactionRollbackState,
     (kDdlSubTxnRollbackInProgress)
     (kDdlSubTxnRollbackPostProcessingFailed));
 
-YB_DEFINE_ENUM(
-    DeleteYsqlDBTablesType,
+YB_DEFINE_ENUM(DeleteYsqlDBTablesType,
     (kNormal)                // Reglar DB drop. Can we used during both normal operations and major
                              // upgrade.
     (kMajorUpgradeRollback)  // Delete all rows and tables of the current catalog in order to
@@ -549,8 +548,10 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   // rollback to sub-transaction operation.
   // NOTE: This function must only be called when we know that the table is being deleted i.e. it
   // assumes that the table is being deleted.
-  bool IsTableDeletionDueToRollbackToSubTxn(
-      const scoped_refptr<TableInfo>& table, TransactionId& txn_id);
+  bool IsTableDeletionDueToRollbackToSubTxn(const TableInfo* table, TransactionId& txn_id);
+  template <class LockType>
+  bool IsTableDeletionDueToRollbackToSubTxnWithLock(
+      const TableInfo* table, const LockType& l, TransactionId& txn_id);
 
   // Rollback all the DDL state changes made by the YSQL transaction from the end till
   // rollback_till_ddl_state_index of ysql_ddl_txn_verifier_state i.e.
@@ -604,6 +605,14 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   void ScheduleTriggerDdlVerificationIfNeeded(
     const TransactionMetadata& txn, const LeaderEpoch& epoch, int32_t delay_ms);
 
+  // Invokes TriggerDdlVerificationIfNeeded for each DDL transaction whose verification state is
+  // kDdlPostProcessingFailed.
+  void TriggerDdlVerificationForPostProcessingFailedTxns(const LeaderEpoch& epoch);
+
+  // Test-only: current YsqlDdlVerificationState for txn, or nullopt if not in the verifier map.
+  std::optional<YsqlDdlVerificationState> TEST_GetYsqlDdlVerificationState(
+      const TransactionId& txn_id) const EXCLUDES(ddl_txn_verifier_mutex_);
+
   // Get the information about the specified table.
   Status GetTableSchema(const GetTableSchemaRequestPB* req,
                         GetTableSchemaResponsePB* resp) override;
@@ -653,7 +662,8 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       const std::optional<int64_t>& cas_config_opid_index_less_or_equal,
       const scoped_refptr<TableInfo>& table, const std::string& ts_uuid, const std::string& reason,
       const LeaderEpoch& epoch, HideOnly hide_only = HideOnly::kFalse,
-      KeepData keep_data = KeepData::kFalse);
+      KeepData keep_data = KeepData::kFalse,
+      const TransactionId& exclude_aborting_transaction_id = TransactionId::Nil());
 
   std::shared_ptr<AsyncDeleteReplica> MakeDeleteReplicaTask(
       const TabletServerId& peer_uuid, const TableInfoPtr& table, const TabletId& tablet_id,
@@ -1373,13 +1383,18 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       const LeaderEpoch& epoch) override;
 
   // API to list all available snapshots.
-  Status ListSnapshots(const ListSnapshotsRequestPB* req, ListSnapshotsResponsePB* resp);
+  Status ListSnapshots(
+      const ListSnapshotsRequestPB* req, ListSnapshotsResponsePB* resp);
+
+  Status ListSnapshotsInternal(
+      const ListSnapshotsRequestPB* req, ListSnapshotsResponsePB* resp,
+      bool skip_missing_tables = false);
 
   Status ListSnapshotRestorations(
       const ListSnapshotRestorationsRequestPB* req,
       ListSnapshotRestorationsResponsePB* resp) override;
 
-  Result<SnapshotInfoPB> GetSnapshotInfoForBackup(const TxnSnapshotId& snapshot_id);
+  Result<SnapshotInfoPB> GetSnapshotInfoForClone(const TxnSnapshotId& snapshot_id);
 
   // Generate the SnapshotInfoPB as of read_time from the provided snapshot schedule, and return
   // the set of tablets that were RUNNING as of read_time but were HIDDEN before the actual snapshot
@@ -2192,6 +2207,7 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   // Request tablet servers to delete all replicas of the tablet.
   void DeleteTabletReplicas(
       const TabletInfoPtr& tablet, const std::string& msg, HideOnly hide_only, KeepData keep_data,
+      const TransactionId& exclude_aborting_transaction_id,
       const LeaderEpoch& epoch) override;
 
   // Returns error if and only if it is forbidden to both:
@@ -2211,7 +2227,8 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
   // Tablets should be sorted by tablet_id to avoid deadlocks.
   Status DeleteOrHideTabletsAndSendRequests(
       const TabletInfos& tablets, const TabletDeleteRetainerInfo& delete_retainer,
-      const std::string& reason, const LeaderEpoch& epoch);
+      const std::string& reason, const LeaderEpoch& epoch,
+      TransactionId exclude_abort_txn_id = TransactionId::Nil());
 
   // Sends a prepare delete transaction tablet request to the leader of the status tablet.
   // This will be followed by delete tablet requests to each replica.
@@ -2818,7 +2835,8 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
       const ExternalTableSnapshotDataMap& tables_data, const LeaderEpoch& epoch);
 
   Status RepackSnapshotsForBackup(
-      ListSnapshotsResponsePB* resp, bool include_ddl_in_progress_tables);
+      ListSnapshotsResponsePB* resp, bool include_ddl_in_progress_tables,
+      bool skip_missing_tables = false);
 
   // Helper function for ImportTableEntry.
   Result<bool> CheckTableForImport(
@@ -3273,7 +3291,7 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
     // The table info objects of the tables affected by this rollback to sub-transaction operation.
     std::vector<TableInfoPtr> tables;
     // Set of index tables whose deletion due to rollback to sub-transaction operation was skipped
-    // since its base table.
+    // since its base table is also being deleted.
     std::unordered_set<TableId> indexes_skipped_due_to_base_table_deletion;
   };
 
@@ -3380,6 +3398,11 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
 
   // True when the cluster is a producer of a valid replication stream.
   std::atomic<bool> cdc_enabled_{false};
+
+  // True once we have determined whether CDC is enabled on the master. This is set after CDC
+  // streams are loaded from persisted data during master startup, regardless of whether any CDC
+  // streams actually exist.
+  std::atomic<bool> cdc_enabled_status_known_{false};
 
   // mutex on heartbeat_pg_catalog_versions_cache_
   mutable MutexType heartbeat_pg_catalog_versions_cache_mutex_;

@@ -36,6 +36,8 @@
 #include "yb/common/schema_pbutil.h"
 #include "yb/common/snapshot.h"
 
+#include "yb/cdc/cdc_service.h"
+
 #include "yb/consensus/consensus.h"
 
 #include "yb/docdb/doc_rowwise_iterator.h"
@@ -110,8 +112,7 @@ DEPRECATE_FLAG(bool, enable_transaction_snapshots, "08_2024");
 
 DEPRECATE_FLAG(bool, allow_consecutive_restore, "10_2022");
 
-DEFINE_RUNTIME_bool(
-    enable_namespace_snapshot_workflow, true,
+DEFINE_RUNTIME_bool(enable_namespace_snapshot_workflow, true,
     "Enable namespace-based snapshot creation based on namespace_id. Can be disabled to fallback "
     "to the old snapshot creation workflow where client provides the set of tables to collect as "
     "part of snapshot");
@@ -136,20 +137,19 @@ DEFINE_RUNTIME_uint32(default_snapshot_retention_hours, 24,
     "Number of hours for which to keep the snapshot around. Only used if no value was provided "
     "by the client when creating the snapshot.");
 
-DEFINE_RUNTIME_bool(
-    import_snapshot_using_table_name, false,
+DEFINE_RUNTIME_bool(import_snapshot_using_table_name, false,
     "Use the old workflow of import snapshot where table names in backup/restore sides are used to "
     "build the mappings between tables in backup and restore side. This flag can be enabled as a "
     "safety button in case restore using relfilenode fails.");
 
-DEFINE_RUNTIME_AUTO_bool(
-    enable_export_snapshot_using_relfilenode, kExternal, false, true,
+DEFINE_RUNTIME_AUTO_bool(enable_export_snapshot_using_relfilenode, kExternal, false, true,
     "Enable exporting snapshots with the new format version = 3 that uses relfilenodes.");
 
 DECLARE_bool(enable_ysql);
 DECLARE_string(initial_sys_catalog_snapshot_path);
 DECLARE_bool(enable_table_rewrite_for_cdcsdk_table);
 DECLARE_bool(cdcsdk_use_dropped_table_list_for_cleanup);
+DECLARE_bool(cdc_enable_dynamic_schema_changes);
 
 namespace yb {
 
@@ -604,8 +604,14 @@ Status CatalogManager::CreateTransactionAwareSnapshot(
   return Status::OK();
 }
 
-Status CatalogManager::ListSnapshots(const ListSnapshotsRequestPB* req,
-                                     ListSnapshotsResponsePB* resp) {
+Status CatalogManager::ListSnapshots(
+    const ListSnapshotsRequestPB* req, ListSnapshotsResponsePB* resp) {
+  return ListSnapshotsInternal(req, resp);
+}
+
+Status CatalogManager::ListSnapshotsInternal(
+    const ListSnapshotsRequestPB* req, ListSnapshotsResponsePB* resp,
+    bool skip_missing_tables) {
   auto txn_snapshot_id = TryFullyDecodeTxnSnapshotId(req->snapshot_id());
   if (req->prepare_for_backup() && !txn_snapshot_id) {
     return STATUS(
@@ -617,14 +623,15 @@ Status CatalogManager::ListSnapshots(const ListSnapshotsRequestPB* req,
   bool include_ddl_in_progress_tables =
       req->has_include_ddl_in_progress_tables() ? req->include_ddl_in_progress_tables() : false;
   if (req->prepare_for_backup()) {
-    RETURN_NOT_OK(RepackSnapshotsForBackup(resp, include_ddl_in_progress_tables));
+    RETURN_NOT_OK(
+        RepackSnapshotsForBackup(resp, include_ddl_in_progress_tables, skip_missing_tables));
   }
 
   return Status::OK();
 }
 
 Status CatalogManager::RepackSnapshotsForBackup(
-    ListSnapshotsResponsePB* resp, bool include_ddl_in_progress_tables) {
+    ListSnapshotsResponsePB* resp, bool include_ddl_in_progress_tables, bool skip_missing_tables) {
   SharedLock lock(mutex_);
   TRACE("Acquired catalog manager lock");
   // Repack & extend the backup row entries.
@@ -657,6 +664,13 @@ Status CatalogManager::RepackSnapshotsForBackup(
         TRACE("Looking up table");
         scoped_refptr<TableInfo> table_info = tables_->FindTableOrNull(entry.id());
         if (table_info == nullptr) {
+          if (skip_missing_tables) {
+            LOG(INFO) << Format(
+                "While repacking a snapshot couldn't find snapshotted table $0 in memory, skipping",
+                entry.id());
+            tables_to_skip.insert(entry.id());
+            continue;
+          }
           return STATUS(
               InvalidArgument, "Table not found by ID", entry.id(),
               MasterError(MasterErrorPB::OBJECT_NOT_FOUND));
@@ -1318,13 +1332,14 @@ Status CatalogManager::ImportSnapshotMeta(const ImportSnapshotMetaRequestPB* req
   return Status::OK();
 }
 
-Result<SnapshotInfoPB> CatalogManager::GetSnapshotInfoForBackup(const TxnSnapshotId& snapshot_id) {
+Result<SnapshotInfoPB> CatalogManager::GetSnapshotInfoForClone(const TxnSnapshotId& snapshot_id) {
   ListSnapshotsRequestPB req;
   ListSnapshotsResponsePB resp;
   req.set_snapshot_id(snapshot_id.data(), snapshot_id.size());
   req.set_prepare_for_backup(true);
   RETURN_NOT_OK_PREPEND(
-      ListSnapshots(&req, &resp), Format("Failed to list snapshot: $0", snapshot_id));
+      ListSnapshotsInternal(&req, &resp, /* skip_missing_tables */ true),
+      Format("Failed to list snapshot: $0", snapshot_id));
   if (resp.snapshots().size() < 1) {
     return STATUS_FORMAT(InvalidArgument, "Unknown snapshot: $0", snapshot_id);
   }
@@ -1366,7 +1381,7 @@ CatalogManager::GenerateSnapshotInfoFromScheduleForClone(
   // Get the SnapshotInfoPB, save the set of tablets it contained, and clear backup_entries.
   // backup_entries will be repopulated with the set of tablets that were running at read_time
   // later when reading from DocDB as of read_time.
-  auto snapshot_info = VERIFY_RESULT(GetSnapshotInfoForBackup(snapshot_id));
+  auto snapshot_info = VERIFY_RESULT(GetSnapshotInfoForClone(snapshot_id));
   std::unordered_set<TabletId> snapshotted_tablets;
   for (auto& backup_entry : snapshot_info.backup_entries()) {
     if (backup_entry.entry().type() == SysRowEntryType::TABLET) {
@@ -2087,7 +2102,9 @@ Status CatalogManager::RepartitionTable(const TableInfoPtr& table,
 
   // Finally, now that everything is committed, send the delete tablet requests.
   for (auto& old_tablet : old_tablets) {
-    DeleteTabletReplicas(old_tablet, deletion_msg, HideOnly::kFalse, KeepData::kFalse, epoch);
+    DeleteTabletReplicas(
+        old_tablet, deletion_msg, HideOnly::kFalse, KeepData::kFalse,
+        TransactionId::Nil() /* exclude_aborting_transaction_id */, epoch);
   }
   VLOG_WITH_FUNC(2) << "Sent delete tablet requests for " << old_tablets.size() << " old tablets"
                     << " of table " << table->id();
@@ -3610,7 +3627,35 @@ Status CatalogManager::GetYsqlYbSystemTableInfo(
 
 docdb::HistoryCutoff CatalogManager::AllowedHistoryCutoffProvider(
     tablet::RaftGroupMetadata* metadata) {
-  return master_->snapshot_coordinator().AllowedHistoryCutoffProvider(metadata);
+  auto cutoff = master_->snapshot_coordinator().AllowedHistoryCutoffProvider(metadata);
+
+  DCHECK_EQ(metadata->table_id(), kSysCatalogTableId);
+
+  // Until we know that CDC is enabled or not via the cdc_enabled_status_known_, we return a cutoff
+  // of HybridTime::kMin.
+  if (!cdc_enabled_status_known_.load(std::memory_order_acquire)) {
+    cutoff.MakeAtMost({HybridTime::kMin, HybridTime::kMin});
+    return cutoff;
+  }
+
+  auto cdc_service = master_->tablet_server()->GetCDCService();
+  // If CDC service is not enabled, then we don't consult CDC for cutoff calculation.
+  if (!cdc_service || !cdc_service->CDCEnabled()) {
+    return cutoff;
+  }
+
+  // CDC service is enabled, so we can consult it for cutoff calculation.
+  // Until CDCMasterBgTask has not run at least once, return cutoff equal to HybridTime::kMin. Once
+  // it has run, we then use the cdc_sdk_safe_time for cutoff calculation.
+  if (!cdc_service->HasCDCMasterBgTaskRunOnce()) {
+    cutoff.MakeAtMost({HybridTime::kMin, HybridTime::kMin});
+  } else {
+    VLOG(1) << "CDC SDK historycutoff: " << metadata->cdc_sdk_safe_time()
+            << " for tablet: " << metadata->raft_group_id();
+    cutoff.MakeAtMost({metadata->cdc_sdk_safe_time(), metadata->cdc_sdk_safe_time()});
+  }
+
+  return cutoff;
 }
 
 }  // namespace master

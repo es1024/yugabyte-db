@@ -303,6 +303,7 @@ static void assign_yb_enable_base_scans_cost_model(bool new_value, void *extra);
 
 static bool check_yb_disable_pg_snapshot_mgmt_in_repeatable_read(bool *newval, void **extra, GucSource source);
 static bool check_yb_enable_advisory_locks(bool *newval, void **extra, GucSource source);
+static bool check_yb_enable_concurrent_ddl(bool *newval, void **extra, GucSource source);
 static bool check_yb_dist_tracecontext(char **newval, void **extra, GucSource source);
 static void assign_yb_dist_tracecontext(const char *newval, void *extra);
 
@@ -2853,6 +2854,19 @@ static struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
+		{"yb_test_invalidate_relcache_in_planner", PGC_SUSET, DEVELOPER_OPTIONS,
+			gettext_noop("When set, the relcache entries for every base relation "
+						 "and its indexes will be invalidated after "
+						 "add_base_rels_to_query() in query_planner()."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_test_invalidate_relcache_in_planner,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"yb_test_fail_next_inc_catalog_version", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("When set, the next increment catalog version will "
 						 "fail right before it's done. This only works when "
@@ -3427,14 +3441,14 @@ static struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
-		{"yb_enable_index_backfill_column_projection", PGC_USERSET, QUERY_TUNING_OTHER,
-			gettext_noop("Enables index backfill column projection optimization. "
-						 "If true, index build/backfill only reads columns needed for the index, "
-						 "rather than all columns from the base table."),
+		{"yb_enable_index_backfill_scan_optimization", PGC_USERSET, QUERY_TUNING_OTHER,
+			gettext_noop("Enables index backfill scan optimizations. "
+						 "If true, index build/backfill reads only the columns needed for the "
+						 "index and pushes partial index predicates down to the base table scan."),
 			NULL,
 			GUC_NOT_IN_SAMPLE
 		},
-		&yb_enable_index_backfill_column_projection,
+		&yb_enable_index_backfill_scan_optimization,
 		false,
 		NULL, NULL, NULL
 	},
@@ -3446,6 +3460,18 @@ static struct config_bool ConfigureNamesBool[] =
 			GUC_NOT_IN_SAMPLE
 		},
 		&yb_enable_fkey_catcache,
+		true,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_enable_fkey_batched_docdb_lookup_when_types_mismatch", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Enable batched DocDB lookup for foreign key constraint check "
+						 "when types mismatch."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_enable_fkey_batched_docdb_lookup_when_types_mismatch,
 		true,
 		NULL, NULL, NULL
 	},
@@ -3508,6 +3534,17 @@ static struct config_bool ConfigureNamesBool[] =
 		&yb_enable_advisory_locks,
 		true,
 		check_yb_enable_advisory_locks, NULL, NULL
+	},
+
+	{
+		{"yb_enable_concurrent_ddl", PGC_USERSET, CUSTOM_OPTIONS,
+			gettext_noop("DEPRECATED - Please see the documentation for the correct flag"),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_enable_concurrent_ddl,
+		false,
+		check_yb_enable_concurrent_ddl, NULL, NULL
 	},
 
 	{
@@ -4018,6 +4055,17 @@ static struct config_bool ConfigureNamesBool[] =
 			GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL
 		},
 		&yb_enable_mage,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_pg_stat_plans_show_max_exec_params", PGC_SUSET, STATS_MONITORING,
+			gettext_noop("Show QPM maximum execution time parameter values."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_qpm_configuration.show_max_exec_params,
 		false,
 		NULL, NULL, NULL
 	},
@@ -7955,6 +8003,7 @@ static const char *const YbDbAdminVariables[] = {
 	"yb_speculatively_execute_pl_statements",
 	"yb_whitelist_extra_statements_for_pl_speculative_execution",
 	"yb_test_make_all_ddl_statements_incrementing",
+	"yb_pg_stat_plans_show_max_exec_params",
 };
 
 
@@ -9167,7 +9216,7 @@ yb_should_report_guc(struct config_generic *record)
 		/*
 		 * A special case has been added here for auth passthrough mode where we do
 		 * not want to report GUC variables to connection manager in case auth
-		 * passthrough has failed.
+		 * passthrough has failed or during post auth GUC rollback.
 		 * Specifically, we do not want to send back ParameterStatus packets for
 		 * GUCs like session_authorization, client_encoding that are set during the
 		 * authentication phase of Auth Passthrough as this causes certain
@@ -9175,7 +9224,7 @@ yb_should_report_guc(struct config_generic *record)
 		 */
 		shouldReportGUC =
 			shouldReportGUC &&
-			(MyProcPort == NULL || !MyProcPort->yb_has_auth_passthrough_failed);
+			(MyProcPort == NULL || !MyProcPort->yb_has_auth_passthrough_finished);
 	}
 	return shouldReportGUC;
 }
@@ -11268,7 +11317,8 @@ set_config_option_ext(const char *name, const char *value,
 	/*
 	 * YB: When in Auth Passthrough mode of conn mgr, avoid setting defaults on
 	 * the control backend (auth_passthrough_req == true) when parsing startup
-	 * packet GUC opts (source == PGC_S_CLIENT).
+	 * packet GUC opts (source >= PGC_S_CLIENT) and when applying settings from
+	 * pg_db_role_setting (source >= PGC_S_GLOBAL).
 	 * We do not wish to set defaults in this case as GUCs on the control
 	 * backend need to be reverted to their original defaults in preparation for
 	 * the next authentication attempt. Changes made via makeDefault are
@@ -11276,12 +11326,15 @@ set_config_option_ext(const char *name, const char *value,
 	 * of defaults serves no purpose during authentication either as conn mgr is
 	 * responsible for tracking client session defaults during the deploy phase
 	 * on txn backends.
+	 *
+	 * We use PGC_S_GLOBAL as the threshold because sources below it (e.g.
+	 * PGC_S_DYNAMIC_DEFAULT, PGC_S_FILE) are used in assign hooks and related
+	 * automatic GUC mutations triggered by changing session_authorization and
+	 * we do not want to change their behaviour during auth passthrough.
 	 */
 	if (MyProcPort != NULL && MyProcPort->yb_is_auth_passthrough_req &&
-		source >= PGC_S_CLIENT)
-	{
+		source >= PGC_S_GLOBAL)
 		makeDefault = false;
-	}
 
 	/*
 	 * Ignore attempted set if overridden by previously processed setting.
@@ -17291,6 +17344,16 @@ check_yb_enable_advisory_locks(bool *newval, void **extra, GucSource source)
 	ereport(WARNING,
 			(errmsg("the parameter \"yb_enable_advisory_locks\" is deprecated, "
 					"toggle the runtime flag \"ysql_yb_enable_advisory_locks\" instead.")));
+	return true;				/* still allow usage, but warn */
+}
+
+static bool
+check_yb_enable_concurrent_ddl(bool *newval, void **extra, GucSource source)
+{
+	ereport(WARNING,
+			(errmsg("the parameter \"yb_enable_concurrent_ddl\" is deprecated "
+					"and has no effect."),
+			 errhint("Please check the documentation for the correct flag.")));
 	return true;				/* still allow usage, but warn */
 }
 

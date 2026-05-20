@@ -74,8 +74,7 @@ DEFINE_NON_RUNTIME_uint64(object_lock_cleanup_interval_ms, 5000,
                           "The interval between runs of the background cleanup task for "
                           "table-level locks held by unresponsive TServers.");
 
-DEFINE_test_flag(
-    bool, skip_launch_release_request, false,
+DEFINE_test_flag(bool, skip_launch_release_request, false,
     "If true, skip launching the release request after persisting it to in progress requests.");
 
 DEFINE_test_flag(bool, allow_unknown_txn_release_request, false,
@@ -119,6 +118,7 @@ Status ValidateLockRequest(
 }
 
 constexpr auto kTserverRpcsTimeoutDefaultSecs = 60s;
+constexpr auto kTserverRpcsBufferForTimeoutDetection = 5s;
 
 template <typename T>
   requires std::disjunction_v<
@@ -437,6 +437,12 @@ class UpdateTServer : public RetrySpecificTSRpcTask {
   Req request() const;
 
   bool RetryTaskAfterRPCFailure(const Status& status) override;
+
+  MonoTime ComputeDeadline() const override {
+    auto computed_deadline = RetrySpecificTSRpcTask::ComputeDeadline();
+    computed_deadline.AddDelta(kTserverRpcsBufferForTimeoutDetection);
+    return computed_deadline;
+  }
 
  private:
   TabletId tablet_id() const override { return TabletId(); }

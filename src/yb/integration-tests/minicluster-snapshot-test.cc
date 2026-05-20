@@ -1733,6 +1733,163 @@ TEST_F(PgCloneTest, CloneWithSpecialCharsInDbName) {
   ASSERT_EQ(count, 0);
 }
 
+TEST_F(PgCloneTest, CloneWithBackslashInDbName) {
+  // Test that target database name containing a backslash should clone successfully.
+  const std::string kBackslashDbName = "post\\gres";
+  ASSERT_OK(source_conn_->ExecuteFormat(
+      "CREATE DATABASE $0 TEMPLATE $1", pgwrapper::PqEscapeIdentifier(kBackslashDbName),
+      kSourceNamespaceName));
+
+  // Verify the database is registered under the expected name.
+  auto db_count = ASSERT_RESULT(source_conn_->FetchRow<int64_t>(
+      Format("SELECT count(*) FROM pg_database WHERE datname = '$0'", kBackslashDbName)));
+  ASSERT_EQ(db_count, 1);
+
+  // Verify the cloned database is accessible and inherits the source schema.
+  auto clone_conn = ASSERT_RESULT(ConnectToDB(kBackslashDbName));
+  auto count = ASSERT_RESULT(clone_conn.FetchRow<int64_t>("SELECT count(*) FROM t1"));
+  ASSERT_EQ(count, 0);
+}
+
+TEST_F(PgCloneTest, CloneWithQuotedSourceOwner) {
+  const std::string kSourceOwner = "src-owner";
+  const std::string kTargetOwner = "clone_owner";
+
+  ASSERT_OK(source_conn_->ExecuteFormat(
+      "CREATE ROLE $0 LOGIN", pgwrapper::PqEscapeIdentifier(kSourceOwner)));
+  ASSERT_OK(source_conn_->ExecuteFormat("CREATE ROLE $0 LOGIN", kTargetOwner));
+  ASSERT_OK(source_conn_->ExecuteFormat(
+      "ALTER DATABASE $0 OWNER TO $1", kSourceNamespaceName,
+      pgwrapper::PqEscapeIdentifier(kSourceOwner)));
+
+  ASSERT_OK(source_conn_->ExecuteFormat(
+      "CREATE DATABASE $0 TEMPLATE $1 OWNER $2", kTargetNamespaceName1, kSourceNamespaceName,
+      kTargetOwner));
+
+  auto owner = ASSERT_RESULT(source_conn_->FetchRows<std::string>(Format(
+      "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = $0",
+      pgwrapper::PqEscapeLiteral(kTargetNamespaceName1))));
+  ASSERT_EQ(owner.size(), 1);
+  ASSERT_EQ(owner[0], kTargetOwner);
+}
+
+TEST_F(PgCloneTest, CloneWithSpecialCharsInOwner) {
+  const std::string kSourceOwner = "r1";
+  const std::string kInjectedRole = "pwned_via_clone";
+  const std::string kTargetOwner = Format("$0; CREATE ROLE $1; --", kSourceOwner, kInjectedRole);
+
+  ASSERT_OK(source_conn_->ExecuteFormat("CREATE ROLE $0 LOGIN", kSourceOwner));
+  ASSERT_OK(source_conn_->ExecuteFormat(
+      "CREATE ROLE $0 LOGIN", pgwrapper::PqEscapeIdentifier(kTargetOwner)));
+  ASSERT_OK(source_conn_->ExecuteFormat(
+      "ALTER DATABASE $0 OWNER TO $1", kSourceNamespaceName, kSourceOwner));
+
+  ASSERT_OK(source_conn_->ExecuteFormat(
+      "CREATE DATABASE $0 TEMPLATE $1 OWNER $2", kTargetNamespaceName1, kSourceNamespaceName,
+      pgwrapper::PqEscapeIdentifier(kTargetOwner)));
+
+  auto injected_role_count_query = Format(
+      "SELECT COUNT(*) FROM pg_roles WHERE rolname = $0",
+      pgwrapper::PqEscapeLiteral(kInjectedRole));
+  auto injected_role_count =
+      ASSERT_RESULT(source_conn_->FetchRow<int64_t>(injected_role_count_query));
+  ASSERT_EQ(injected_role_count, 0);
+
+  auto owner_query = Format(
+      "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = $0",
+      pgwrapper::PqEscapeLiteral(kTargetNamespaceName1));
+  auto owner = ASSERT_RESULT(source_conn_->FetchRow<std::string>(owner_query));
+  ASSERT_EQ(owner, kTargetOwner);
+}
+
+TEST_F(PgCloneTest, CloneRewritesOwnersOfSourceOwnedObjects) {
+  // ysql_dump's --rename-owner machinery must rewrite "OWNER TO X" to "OWNER TO Y" only when X
+  // equals the source database owner (read from pg_database.datdba); other owners must be
+  // emitted unchanged. This test exercises that selectivity across tables, materialized views,
+  // sequences, and functions: for each kind we create one object owned by the source DB owner
+  // (must be rewritten on clone) and one owned by an unrelated role (must be preserved). The
+  // test fixture's pre-existing `t1` table, owned by the default connection user, gives a
+  // third witness that survives the clone unchanged.
+  const std::string kSourceOwner = "src_owner";
+  const std::string kOtherOwner = "other_owner";
+  const std::string kTargetOwner = "tgt_owner";
+
+  ASSERT_OK(source_conn_->ExecuteFormat("CREATE ROLE $0", kSourceOwner));
+  ASSERT_OK(source_conn_->ExecuteFormat("CREATE ROLE $0", kOtherOwner));
+  ASSERT_OK(source_conn_->ExecuteFormat("CREATE ROLE $0", kTargetOwner));
+
+  // Make src_owner the source DB owner so its objects become candidates for the rewrite.
+  ASSERT_OK(source_conn_->ExecuteFormat(
+      "ALTER DATABASE $0 OWNER TO $1", kSourceNamespaceName, kSourceOwner));
+
+  ASSERT_OK(source_conn_->Execute("CREATE TABLE src_table (k INT PRIMARY KEY)"));
+  ASSERT_OK(source_conn_->Execute("CREATE TABLE other_table (k INT PRIMARY KEY)"));
+  ASSERT_OK(source_conn_->Execute("CREATE SEQUENCE src_seq"));
+  ASSERT_OK(source_conn_->Execute("CREATE SEQUENCE other_seq"));
+  ASSERT_OK(source_conn_->Execute(
+      "CREATE MATERIALIZED VIEW src_mv AS SELECT 1 AS x"));
+  ASSERT_OK(source_conn_->Execute(
+      "CREATE MATERIALIZED VIEW other_mv AS SELECT 1 AS x"));
+  ASSERT_OK(source_conn_->Execute(
+      "CREATE FUNCTION src_fn() RETURNS INT LANGUAGE SQL AS 'SELECT 1'"));
+  ASSERT_OK(source_conn_->Execute(
+      "CREATE FUNCTION other_fn() RETURNS INT LANGUAGE SQL AS 'SELECT 1'"));
+
+  ASSERT_OK(source_conn_->ExecuteFormat("ALTER TABLE src_table OWNER TO $0", kSourceOwner));
+  ASSERT_OK(source_conn_->ExecuteFormat("ALTER TABLE other_table OWNER TO $0", kOtherOwner));
+  ASSERT_OK(source_conn_->ExecuteFormat("ALTER SEQUENCE src_seq OWNER TO $0", kSourceOwner));
+  ASSERT_OK(source_conn_->ExecuteFormat("ALTER SEQUENCE other_seq OWNER TO $0", kOtherOwner));
+  ASSERT_OK(source_conn_->ExecuteFormat(
+      "ALTER MATERIALIZED VIEW src_mv OWNER TO $0", kSourceOwner));
+  ASSERT_OK(source_conn_->ExecuteFormat(
+      "ALTER MATERIALIZED VIEW other_mv OWNER TO $0", kOtherOwner));
+  ASSERT_OK(source_conn_->ExecuteFormat("ALTER FUNCTION src_fn() OWNER TO $0", kSourceOwner));
+  ASSERT_OK(source_conn_->ExecuteFormat("ALTER FUNCTION other_fn() OWNER TO $0", kOtherOwner));
+
+  ASSERT_OK(source_conn_->ExecuteFormat(
+      "CREATE DATABASE $0 TEMPLATE $1 OWNER $2",
+      kTargetNamespaceName1, kSourceNamespaceName, kTargetOwner));
+
+  auto target_conn = ASSERT_RESULT(ConnectToDB(kTargetNamespaceName1));
+
+  // Sanity: the cloned database itself is owned by tgt_owner.
+  auto db_owner = ASSERT_RESULT(target_conn.FetchRow<std::string>(Format(
+      "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = $0",
+      pgwrapper::PqEscapeLiteral(kTargetNamespaceName1))));
+  ASSERT_EQ(db_owner, kTargetOwner);
+
+  auto fetch_relation_owner = [&target_conn](const std::string& name) -> Result<std::string> {
+    return target_conn.FetchRow<std::string>(Format(
+        "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = $0",
+        pgwrapper::PqEscapeLiteral(name)));
+  };
+  auto fetch_function_owner = [&target_conn](const std::string& name) -> Result<std::string> {
+    return target_conn.FetchRow<std::string>(Format(
+        "SELECT pg_get_userbyid(proowner) FROM pg_proc WHERE proname = $0",
+        pgwrapper::PqEscapeLiteral(name)));
+  };
+
+  // src_* objects: owner must be rewritten src_owner -> tgt_owner.
+  for (const auto& rel : {"src_table", "src_seq", "src_mv"}) {
+    auto actual_owner = ASSERT_RESULT(fetch_relation_owner(rel));
+    EXPECT_EQ(actual_owner, kTargetOwner) << Format(
+        "Expected owner $0 for relation $1, instead got $2", kTargetOwner, rel, actual_owner);
+  }
+  EXPECT_EQ(ASSERT_RESULT(fetch_function_owner("src_fn")), kTargetOwner);
+
+  // other_* objects: owner must survive the clone unchanged.
+  for (const auto& rel : {"other_table", "other_seq", "other_mv"}) {
+    auto actual_owner = ASSERT_RESULT(fetch_relation_owner(rel));
+    EXPECT_EQ(actual_owner, kOtherOwner) << Format(
+        "Expected owner $0 for relation $1, instead got $2", kOtherOwner, rel, actual_owner);
+  }
+  EXPECT_EQ(ASSERT_RESULT(fetch_function_owner("other_fn")), kOtherOwner);
+
+  // Witness from the fixture: t1 was created in SetUp by the default connection user (neither
+  // src_owner nor other_owner), so its owner must not match tgt_owner after the clone.
+  EXPECT_NE(ASSERT_RESULT(fetch_relation_owner(kSourceTableName)), kTargetOwner);
+}
+
 TEST_F(PgCloneTest, CloneAfterSuccessiveRenames) {
   const std::string kRenamedNamespaceName = "testdb_renamed";
 
@@ -1815,6 +1972,73 @@ TEST_F(PgCloneTest, DisallowCloneIntoForwardRestoreGap) {
       t2.ToInt64());
   ASSERT_NOK(status);
   ASSERT_STR_CONTAINS(status.message().ToBuffer(), "Cannot perform a forward restore");
+}
+
+TEST_F(PgCloneTest, CloneAfterPitrRemovedTableFromSnapshot) {
+  // When PITR rolls back the catalog to a time before some non-colocated table existed, PITR's
+  // PrepareTabletCleanup writes that table's tablets straight to DELETED. Once the tablets are
+  // DELETED, AreAllTabletsDeleted() is true and the CleanupHiddenTables / CleanUpDeletedTables bg
+  // tasks fully erase the table from the live catalog (tables_).
+  //
+  // The snapshot used to perform the PITR still references that table in its sys_row entries, and
+  // could be used for a subsequent clone operation. This test verifies the clone flow can still use
+  // that snapshot, despite the missing table it references.
+  const std::string kExtraTableName = "extra_table";
+
+  auto t_clone = ASSERT_RESULT(GetCurrentTime());
+  auto t_pitr = ASSERT_RESULT(GetCurrentTime());
+  ASSERT_LT(t_clone.ToInt64(), t_pitr.ToInt64());
+
+  ASSERT_OK(source_conn_->ExecuteFormat(
+      "CREATE TABLE $0 (key INT PRIMARY KEY, value INT)", kExtraTableName));
+  ASSERT_OK(source_conn_->ExecuteFormat("INSERT INTO $0 VALUES (1, 10)", kExtraTableName));
+
+  // PITR back to t_pitr (before extra_table existed). The master creates a schedule snapshot
+  // on demand whose range covers both t_pitr and t_clone, and which references extra_table.
+  LOG(INFO) << "Restoring to t_pitr: " << t_pitr;
+  auto restoration_id = ASSERT_RESULT(RestoreSnapshotSchedule(
+      master_backup_proxy_.get(), schedule_id_,
+      HybridTime::FromMicros(static_cast<uint64>(t_pitr.ToInt64())), kTimeout));
+  ASSERT_OK(WaitForRestoration(master_backup_proxy_.get(), restoration_id, kTimeout));
+  LOG(INFO) << "Restoration complete.";
+
+  // Reconnect since PITR may invalidate the PG connection.
+  source_conn_ = std::make_unique<pgwrapper::PGConn>(
+      ASSERT_RESULT(ConnectToDB(kSourceNamespaceName)));
+
+  // Wait until extra_table has been fully removed from tables_. Sequence after PITR is:
+  // PITR sets hide_state=HIDING and tablets directly to DELETED -> bg task transitions
+  // HIDING -> HIDDEN -> CleanupHiddenTables sees AreAllTabletsDeleted() and marks state=DELETED
+  // -> CleanUpDeletedTables erases the table from tables_.
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto table = GetTable(kExtraTableName, kSourceNamespaceName);
+        if (table.ok()) {
+          return false;
+        }
+        if (table.status().IsNotFound()) {
+          return true;
+        }
+        return table.status();
+      },
+      MonoDelta::FromSeconds(60),
+      "Wait for extra_table to be removed from tables_"));
+
+  // Clone source DB as of t_clone. The clone logic should handle the missing extra_table referenced
+  // by the snapshot.
+  ASSERT_OK(source_conn_->ExecuteFormat(
+      "CREATE DATABASE $0 TEMPLATE $1 AS OF $2", kTargetNamespaceName1, kSourceNamespaceName,
+      t_clone.ToInt64()));
+
+  // Sanity checks: t1 (created during SetUp before t_clone was captured) should exist in the
+  // clone; extra_table (created after t_clone) should not.
+  auto target_conn = ASSERT_RESULT(ConnectToDB(kTargetNamespaceName1));
+  auto extra_count = ASSERT_RESULT(target_conn.FetchRow<int64_t>(Format(
+      "SELECT count(*) FROM pg_class WHERE relname = '$0'", kExtraTableName)));
+  ASSERT_EQ(extra_count, 0);
+  auto t1_count = ASSERT_RESULT(
+      target_conn.FetchRow<int64_t>("SELECT count(*) FROM t1"));
+  ASSERT_EQ(t1_count, 0);
 }
 
 }  // namespace master

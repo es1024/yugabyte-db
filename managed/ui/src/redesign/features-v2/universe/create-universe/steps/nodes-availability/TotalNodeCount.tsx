@@ -30,7 +30,6 @@ export const TotalNodeCount = () => {
   const { watch } = useFormContext<NodeAvailabilityProps>();
   const az = watch('availabilityZones');
   const useDedicatedNodes = watch('useDedicatedNodes');
-  const replicationFactor = watch(REPLICATION_FACTOR);
   const totalNodeCount = getNodeCount(az);
   const totalNodesLabel = useDedicatedNodes ? t('totalNodesTserver') : t('totalNodes');
 
@@ -38,7 +37,6 @@ export const TotalNodeCount = () => {
     <NodesCount>
       <span>{totalNodesLabel}</span>
       {totalNodeCount}
-      {useDedicatedNodes && <span style={{ marginLeft: '8px' }}>{replicationFactor}</span>}
     </NodesCount>
   );
 };

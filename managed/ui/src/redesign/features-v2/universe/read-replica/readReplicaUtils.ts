@@ -21,6 +21,10 @@ export function getReadReplicaExitRoute(universeUuid?: string | null) {
   return `/universes/${universeUuid ?? ''}/settings`;
 }
 
+export function getAddGeoPartitionRoute(universeUuid?: string | null) {
+  return `/universes/${universeUuid ?? ''}/add-geo-partition`;
+}
+
 export function getK8TserverResourceFromNodeSpec(
   nodeSpec: ClusterSpec['node_spec']
 ): K8NodeSpec | null {

@@ -61,10 +61,10 @@ namespace yb {
 namespace {
 
 std::string GetProcfsThreadPath(int64_t tid, std::string_view config) {
-  // On Linux, threads ids and process ids are in the same namespace, so /proc/$TID/$CONF works. And
-  // this lets us get information for threads not under this process as well (e.g. child process
-  // threads).
-  return Format("/proc/$0/$1", tid, config);
+  // On Linux, threads ids and process ids are in the same namespace, so /proc/$TID/task/$TID/$CONF
+  // works. And this lets us get information for threads not under this process as well (e.g. child
+  // process threads).
+  return Format("/proc/$0/task/$0/$1", tid, config);
 }
 
 } // namespace

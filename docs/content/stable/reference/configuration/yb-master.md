@@ -1219,6 +1219,19 @@ Default: `true`
 
 Toggle automatic tablet splitting for tables under replication slot. Applicable only to CDC using the [PostgreSQL logical replication protocol](../../../additional-features/change-data-capture/using-logical-replication/).
 
+### LISTEN/NOTIFY flags
+
+{{<tags/feature/ea idea="1901">}}Available in v2025.2.3 and later. To learn about LISTEN/NOTIFY, see [LISTEN, NOTIFY, and UNLISTEN](../../../api/ysql/the-sql-language/statements/cmd_listen_notify/).
+
+##### --ysql_yb_enable_listen_notify
+
+{{% tags/wrap %}}
+{{<tags/feature/t-server>}}
+Default: `false`
+{{% /tags/wrap %}}
+
+Enables YSQL LISTEN/NOTIFY.
+
 ### File expiration based on TTL flags
 
 ##### --tablet_enable_ttl_file_filter
@@ -1766,15 +1779,6 @@ Default: `1`
 {{% /tags/wrap %}}
 
 The maximum number of threads allowed for non-admin full compactions. This includes post-split compactions (compactions that remove irrelevant data from new tablets after splits) and scheduled full compactions.
-
-##### --full_compaction_pool_max_queue_size
-
-{{% tags/wrap %}}
-{{<tags/feature/restart-needed>}}
-Default: `500`
-{{% /tags/wrap %}}
-
-The maximum number of full compaction tasks that can be queued simultaneously. This includes post-split compactions (compactions that remove irrelevant data from new tablets after splits) and scheduled full compactions.
 
 ##### --auto_compact_check_interval_sec
 

@@ -23,6 +23,7 @@ import { RRRegionsAndAZSettings } from './steps/RRRegionsAndAZ/dtos';
 import { RRInstanceSettingsProps } from './steps/RRInstanceSettings/RRInstanceSettings';
 import { getClusterByType } from '../../edit-universe/EditUniverseUtils';
 import { getReadOnlyCluster } from '@app/redesign/utils/universeUtils';
+import { getExistingGeoPartitions } from '../../geo-partition/add/AddGeoPartitionUtils';
 
 export function sumReadReplicaNodeCounts(regionsAndAZ: RRRegionsAndAZSettings): number {
   return regionsAndAZ.regions.reduce(
@@ -133,8 +134,9 @@ function buildReadReplicaNodeSpec(
 type ReadReplicaSizingAndPlacement = {
   num_nodes: number;
   node_spec: ClusterNodeSpec;
-  partitions_spec: ClusterPartitionSpec[];
   provider_spec: NonNullable<ClusterEditSpec['provider_spec']>;
+  placement_spec?: ClusterPlacementSpec;
+  partitions_spec?: ClusterPartitionSpec[];
 };
 
 function getExistingAsyncPlacementCloud(
@@ -186,8 +188,11 @@ export function buildReadReplicaClusterSizingAndPlacement(
     throw new Error('READ_REPLICA_PROVIDER_MISSING');
   }
 
-  const cloudList = primary?.placement_spec?.cloud_list;
-  const cloudCode = cloudList?.[0]?.code;
+  const primaryCloud =
+    primary?.placement_spec?.cloud_list?.[0] ??
+    (primary?.partitions_spec?.find((p) => p.default_partition) ?? primary?.partitions_spec?.[0])
+      ?.placement?.cloud_list?.[0];
+  const cloudCode = primaryCloud?.code;
   if (!cloudCode) {
     throw new Error('READ_REPLICA_CLOUD_CODE_MISSING');
   }
@@ -210,7 +215,7 @@ export function buildReadReplicaClusterSizingAndPlacement(
   if (num_nodes < 1) {
     throw new Error('READ_REPLICA_NODE_COUNT_INVALID');
   }
-  
+
   const hasInvalidAzReplicationFactor = regionList.some((region) =>
     (region.az_list ?? []).some(
       (az) => (az.replication_factor ?? 0) > (az.num_nodes_in_az ?? 0)
@@ -220,44 +225,41 @@ export function buildReadReplicaClusterSizingAndPlacement(
     throw new Error('READ_REPLICA_REPLICATION_FACTOR_EXCEEDS_NODES');
   }
 
-  const placementReplicaTotal = Math.max(1, sumPlacementAzReplicationFactors(regionList));
-
-  const partitionPlacement: ClusterPlacementSpec = {
-    cloud_list: [
-      {
-        uuid: providerUuid,
-        code: cloudCode,
-        default_region: defaultRegion,
-        ...(typeof existingCloud?.masters_in_default_region === 'boolean'
-          ? { masters_in_default_region: existingCloud.masters_in_default_region }
-          : {}),
-        region_list: regionList
-      } as PlacementCloud
-    ]
-  };
-
-  const partitions_spec = [
-    {
-      name: '',
-      default_partition: true,
-      replication_factor: placementReplicaTotal,
-      placement: partitionPlacement,
-      tablespace_name: ''
-    }
-  ] as ClusterPartitionSpec[];
-
   const provider_spec = {
     region_list: placementRegionUuids
   };
 
   const node_spec = buildReadReplicaNodeSpec(primary, instanceSettings);
 
-  return {
-    num_nodes,
-    node_spec,
-    provider_spec,
-    partitions_spec
-  };
+  const cloudEntry = {
+    uuid: providerUuid,
+    code: cloudCode,
+    default_region: defaultRegion,
+    ...(typeof existingCloud?.masters_in_default_region === 'boolean'
+      ? { masters_in_default_region: existingCloud.masters_in_default_region }
+      : {}),
+    region_list: regionList
+  } as PlacementCloud;
+
+  const isGeoPartitioned = getExistingGeoPartitions(universeData).length > 0;
+
+  if (isGeoPartitioned) {
+    const placementReplicaTotal = Math.max(1, sumPlacementAzReplicationFactors(regionList));
+    const partitionPlacement: ClusterPlacementSpec = { cloud_list: [cloudEntry] };
+    const partitions_spec: ClusterPartitionSpec[] = [
+      {
+        name: '',
+        default_partition: true,
+        replication_factor: placementReplicaTotal,
+        placement: partitionPlacement,
+        tablespace_name: ''
+      }
+    ];
+    return { num_nodes, node_spec, provider_spec, partitions_spec };
+  }
+
+  const placement_spec: ClusterPlacementSpec = { cloud_list: [cloudEntry] };
+  return { num_nodes, node_spec, provider_spec, placement_spec };
 }
 
 /**
